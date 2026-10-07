@@ -2,7 +2,10 @@
 
 這是一個用來記錄寶寶生理時鐘的 LINE 機器人：可以記錄睡眠、吃奶／副食品、排泄、體溫和備註，也能查每日統計。
 
-把機器人加進「爸爸＋媽媽」的 LINE 群組裡，大家記的都會是同一個寶寶的紀錄；一對一聊天則是各自分開記。
+- **完全免費**：只用你的 Google 帳號（Google 試算表 + Apps Script），不用註冊其他服務。
+- **資料在你自己的 Google 試算表裡**：手機打開就能看、能改、能畫圖表。
+- **不會休眠斷線**：Google 的伺服器隨時都醒著。
+- 把機器人加進「爸爸＋媽媽」的 LINE 群組，大家記的都是同一個寶寶的紀錄。
 
 ## 怎麼使用
 
@@ -25,78 +28,72 @@
 
 每則回覆下方都有快速按鈕，常用的動作點一下就好。看不懂的訊息機器人不會回應，所以在群組裡聊天不會被打擾。
 
-## 設定 LINE
+## 安裝（全程用電腦操作，約 15 分鐘）
 
-1. 到 [LINE Developers Console](https://developers.line.biz/console/) 建立一個 **Messaging API** channel。
-2. 取得 **Channel secret**（Basic settings 頁面），並在 Messaging API 頁面發行 **Channel access token**。
-3. 在 Messaging API 頁面：
-   - Webhook URL 填 `https://<你的網域>/callback`，打開 **Use webhook**
-   - 關掉 **Auto-reply messages**
-   - 如果要加進群組，打開 **Allow bot to join group chats**
+### 事前準備：LINE 官方帳號
+1. 在 [LINE 官方帳號管理後台](https://manager.line.biz/) 建立官方帳號（免費方案）。
+2. 到 **設定 → Messaging API**，按 **啟用 Messaging API**。
+3. 到 [LINE Developers Console](https://developers.line.biz/console/) → 你的 channel → **Messaging API** 分頁最下面，在 **Channel access token** 按 **Issue**，複製起來。
+4. 在官方帳號後台的 **設定 → 回應設定**：把「自動回應訊息」**關閉**，「Webhook」**開啟**。
+5. 在 **設定 → 帳號設定**：把「加入群組或多人聊天室」改成**接受邀請**。
 
-## 本機執行
+本 bot 只會「回覆」訊息、不會主動推播，回覆訊息不算官方帳號的訊息則數，所以完全免費。
+
+### 步驟 1：建立試算表並貼上程式
+1. 打開 [Google 試算表](https://sheets.new)，建立一個新的試算表，取名「寶寶紀錄」。
+2. 上方選單：**擴充功能 → Apps Script**。
+3. 把編輯器裡原本的內容全部刪掉，貼上這個 repo 的 [`Code.gs`](Code.gs) 全部內容。
+4. 找到最上面這一行，把引號裡的字換成你的 Channel access token：
+   ```js
+   const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
+   ```
+5. 按 💾 儲存。
+
+### 步驟 2：執行一次 setup（授權）
+1. 在編輯器上方的函式下拉選單選 **setup**，按 **▶ 執行**。
+2. 會跳出「需要授權」→ 按 **審查權限** → 選你的 Google 帳號。
+3. 如果出現「**Google 尚未驗證這個應用程式**」：按左下的 **進階** → **前往「(專案名稱)」（不安全）**。
+   這是因為這個程式是你自己寫的，沒有送 Google 審核，屬於正常現象。
+4. 按 **允許**。
+5. 回到試算表，會看到多了一個「紀錄」工作表。
+
+### 步驟 3：部署
+1. 編輯器右上角 **部署 → 新增部署作業**。
+2. 按「選取類型」旁邊的 ⚙️ → 選 **網頁應用程式**。
+3. 設定：
+   - **執行身分**：我
+   - **誰可以存取**：**所有人**
+4. 按 **部署**，複製 **網頁應用程式網址**（`https://script.google.com/macros/s/.../exec`）。
+5. 用瀏覽器打開這個網址，看到「寶寶紀錄 bot 運作中 👶」就成功了。
+
+### 步驟 4：把網址填到 LINE
+1. 回到 [LINE Developers Console](https://developers.line.biz/console/) → 你的 channel → **Messaging API** 分頁。
+2. **Webhook URL** 按 Edit，貼上剛剛的網址，按 Update。
+3. 打開 **Use webhook**。
+4. 掃同一頁的 QR code 加好友，傳 `說明` 試試看！
+
+> 按 **Verify** 時可能會顯示錯誤（因為 Google 的網址會轉址），只要實際傳訊息有回應就沒問題。
+
+### 之後修改程式
+改完 `Code.gs` 之後，要到 **部署 → 管理部署作業** → 按 ✏️ 編輯 → 版本選 **新版本** → **部署**，修改才會生效。這樣網址不會變，不用回 LINE 改設定。
+
+## 安全提醒
+- Channel access token 等於 bot 的鑰匙，不要分享給別人，也不要上傳到 GitHub。
+- Apps Script 沒辦法驗證訊息是不是真的從 LINE 傳來的，所以**不要把部署網址分享給別人**。網址是一長串亂碼，別人猜不到。
+
+## 試算表欄位
+
+| 編號 | 聊天室 | 類型 | 開始時間 | 結束時間 | 數值 | 單位 | 內容 | 記錄者 | 建立時間 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | C1234… | 餵食 | 2026/10/07 08:00 |  | 120 | ml | 喝奶 | U5678… | … |
+| 2 | C1234… | 睡眠 | 2026/10/07 13:00 | 2026/10/07 14:30 |  |  |  | U5678… | … |
+
+可以直接在試算表裡修改或刪除紀錄，但**不要改動第一列的標題和欄位順序**。
+
+## 開發
+
+程式只有一個檔案 [`Code.gs`](Code.gs)。測試會在 Node.js 裡用假的試算表執行：
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-cp .env.example .env   # 填入 secret 與 token
-export $(cat .env | xargs)
-python app.py          # 開在 http://localhost:8000
-pytest                 # 跑測試（設定 TEST_DATABASE_URL 的話也會測 Postgres）
-```
-
-本機開發可以用 `ngrok http 8000` 取得 https 網址填進 Webhook URL。注意：免費版 ngrok 每次重啟網址都會變，要記得回 LINE Console 更新。
-
-## 免費部署（Render + Neon + UptimeRobot）
-
-全部都用免費方案：
-
-| 服務 | 用途 | 免費額度 |
-|---|---|---|
-| [Neon](https://neon.com/) | PostgreSQL 資料庫，存紀錄 | 0.5 GB，一筆紀錄約 100 bytes，存幾十年都夠 |
-| [Render](https://render.com/) | 執行 bot | 每月 750 小時，剛好夠一個服務 24 小時開著 |
-| [UptimeRobot](https://uptimerobot.com/) | 定時 ping，讓 Render 不要休眠 | 每 5 分鐘檢查一次 |
-
-為什麼資料庫要另外放：Render 免費方案每次重新部署或重啟都會清空磁碟，SQLite 檔案會跟著不見。
-
-### 1. 建立資料庫（Neon）
-1. 註冊 Neon，建立一個 Project（Region 選 Singapore 比較近）。
-2. 在 Dashboard 按 **Connect**，複製連線字串，長得像 `postgresql://user:password@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`。
-
-### 2. 部署 bot（Render）
-1. 用 GitHub 帳號登入 Render，選 **New > Blueprint**，選這個 repo，Render 會照 `render.yaml` 建立服務。
-2. 填入三個環境變數：
-   - `LINE_CHANNEL_SECRET`
-   - `LINE_CHANNEL_ACCESS_TOKEN`
-   - `DATABASE_URL`：剛剛複製的 Neon 連線字串
-3. 部署完會拿到網址，例如 `https://baby-line-bot.onrender.com`。
-
-### 3. 接上 LINE
-到 LINE Developers Console，把 Webhook URL 設成 `https://baby-line-bot.onrender.com/callback`，然後按 **Verify**。
-
-### 4. 防止休眠（UptimeRobot）
-Render 免費服務 15 分鐘沒有流量就會休眠，喚醒大約要一分鐘，這段時間傳的訊息可能沒有回應（也就是「斷線」）。
-
-在 UptimeRobot 新增一個 HTTP monitor，網址填 `https://baby-line-bot.onrender.com/`，間隔 5 分鐘。這個路徑不會讀資料庫，所以不會用掉 Neon 的運算額度。
-
-### 環境變數一覽
-
-| 環境變數 | 說明 |
-|---|---|
-| `LINE_CHANNEL_SECRET` | Channel secret |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Channel access token |
-| `DATABASE_URL` | PostgreSQL 連線字串。沒設定的話改用 SQLite |
-| `DATABASE_PATH` | SQLite 檔案路徑，預設 `baby.db`（只在沒有 `DATABASE_URL` 時使用） |
-| `TZ_NAME` | 時區，預設 `Asia/Taipei` |
-
-也可以用 `Dockerfile` 部署到自己的主機，這時用 SQLite 加上 `/data` volume 就可以了。
-
-## 專案結構
-
-```
-app.py               LINE webhook（Flask）
-babybot/parser.py    文字指令解析
-babybot/service.py   記錄邏輯與回覆文字
-babybot/storage.py   儲存（PostgreSQL 或 SQLite）
-tests/               測試
+npm test
 ```

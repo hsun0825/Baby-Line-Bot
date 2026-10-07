@@ -1,0 +1,8 @@
+{
+  "name": "baby-line-bot",
+  "private": true,
+  "description": "寶寶生理時鐘 LINE Bot（Google Apps Script）",
+  "scripts": {
+    "test": "node --test"
+  }
+}
