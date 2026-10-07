@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -12,9 +13,17 @@ NOW = datetime(2026, 10, 7, 15, 0, tzinfo=TZ)
 CHAT = "C1"
 
 
-@pytest.fixture
-def svc():
-    return BabyService(Storage(":memory:", TZ), TZ)
+BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("TEST_DATABASE_URL") else [])
+
+
+@pytest.fixture(params=BACKENDS)
+def svc(request):
+    if request.param == "sqlite":
+        return BabyService(Storage(TZ, path=":memory:"), TZ)
+    # 測試用的 Postgres，每個測試前清空
+    storage = Storage(TZ, url=os.environ["TEST_DATABASE_URL"])
+    storage._execute("TRUNCATE records")
+    return BabyService(storage, TZ)
 
 
 def at(h, m, day=7):

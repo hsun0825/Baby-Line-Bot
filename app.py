@@ -41,7 +41,12 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 app = Flask(__name__)
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-service = BabyService(Storage(os.environ.get("DATABASE_PATH", "baby.db"), TZ), TZ)
+storage = Storage(
+    TZ,
+    path=os.environ.get("DATABASE_PATH", "baby.db"),
+    url=os.environ.get("DATABASE_URL") or None,
+)
+service = BabyService(storage, TZ)
 
 # 每則回覆下方的快速按鈕
 QUICK_ACTIONS = [

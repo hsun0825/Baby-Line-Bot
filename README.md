@@ -42,25 +42,54 @@ pip install -r requirements-dev.txt
 cp .env.example .env   # 填入 secret 與 token
 export $(cat .env | xargs)
 python app.py          # 開在 http://localhost:8000
-pytest                 # 跑測試
+pytest                 # 跑測試（設定 TEST_DATABASE_URL 的話也會測 Postgres）
 ```
 
 本機開發可以用 `ngrok http 8000` 取得 https 網址填進 Webhook URL。注意：免費版 ngrok 每次重啟網址都會變，要記得回 LINE Console 更新。
 
-## 部署
+## 免費部署（Render + Neon + UptimeRobot）
+
+全部都用免費方案：
+
+| 服務 | 用途 | 免費額度 |
+|---|---|---|
+| [Neon](https://neon.com/) | PostgreSQL 資料庫，存紀錄 | 0.5 GB，一筆紀錄約 100 bytes，存幾十年都夠 |
+| [Render](https://render.com/) | 執行 bot | 每月 750 小時，剛好夠一個服務 24 小時開著 |
+| [UptimeRobot](https://uptimerobot.com/) | 定時 ping，讓 Render 不要休眠 | 每 5 分鐘檢查一次 |
+
+為什麼資料庫要另外放：Render 免費方案每次重新部署或重啟都會清空磁碟，SQLite 檔案會跟著不見。
+
+### 1. 建立資料庫（Neon）
+1. 註冊 Neon，建立一個 Project（Region 選 Singapore 比較近）。
+2. 在 Dashboard 按 **Connect**，複製連線字串，長得像 `postgresql://user:password@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`。
+
+### 2. 部署 bot（Render）
+1. 用 GitHub 帳號登入 Render，選 **New > Blueprint**，選這個 repo，Render 會照 `render.yaml` 建立服務。
+2. 填入三個環境變數：
+   - `LINE_CHANNEL_SECRET`
+   - `LINE_CHANNEL_ACCESS_TOKEN`
+   - `DATABASE_URL`：剛剛複製的 Neon 連線字串
+3. 部署完會拿到網址，例如 `https://baby-line-bot.onrender.com`。
+
+### 3. 接上 LINE
+到 LINE Developers Console，把 Webhook URL 設成 `https://baby-line-bot.onrender.com/callback`，然後按 **Verify**。
+
+### 4. 防止休眠（UptimeRobot）
+Render 免費服務 15 分鐘沒有流量就會休眠，喚醒大約要一分鐘，這段時間傳的訊息可能沒有回應（也就是「斷線」）。
+
+在 UptimeRobot 新增一個 HTTP monitor，網址填 `https://baby-line-bot.onrender.com/`，間隔 5 分鐘。這個路徑不會讀資料庫，所以不會用掉 Neon 的運算額度。
+
+### 環境變數一覽
 
 | 環境變數 | 說明 |
 |---|---|
 | `LINE_CHANNEL_SECRET` | Channel secret |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Channel access token |
-| `DATABASE_PATH` | SQLite 檔案路徑，預設 `baby.db` |
+| `DATABASE_URL` | PostgreSQL 連線字串。沒設定的話改用 SQLite |
+| `DATABASE_PATH` | SQLite 檔案路徑，預設 `baby.db`（只在沒有 `DATABASE_URL` 時使用） |
 | `TZ_NAME` | 時區，預設 `Asia/Taipei` |
 
-啟動指令：`gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4`（已寫在 `Procfile`），也可以用 `Dockerfile`。
-
-⚠️ **資料保存**：紀錄存在 SQLite 檔案裡。很多免費主機（例如 Render 免費方案）每次重新部署或重啟都會清空磁碟，紀錄就會不見。請把 `DATABASE_PATH` 指到持久化磁碟（Render Disk、Fly.io Volume、Docker volume `/data` 等），或部署在自己的主機上。
-
-⚠️ **避免「斷線」**：免費主機閒置一段時間會休眠，這時 LINE 傳來的訊息可能沒有回應。可以用 [UptimeRobot](https://uptimerobot.com/) 每 5 分鐘 ping 一次 `https://<你的網域>/`（這個路徑會回傳 `OK`），讓它保持清醒。
+也可以用 `Dockerfile` 部署到自己的主機，這時用 SQLite 加上 `/data` volume 就可以了。
 
 ## 專案結構
 
@@ -68,6 +97,6 @@ pytest                 # 跑測試
 app.py               LINE webhook（Flask）
 babybot/parser.py    文字指令解析
 babybot/service.py   記錄邏輯與回覆文字
-babybot/storage.py   SQLite 儲存
+babybot/storage.py   儲存（PostgreSQL 或 SQLite）
 tests/               測試
 ```
