@@ -106,7 +106,7 @@ test('解析餵食', () => {
     ['配方奶150ml', 150, 'ml', '配方奶'],
     ['母乳 左 15', 15, '分鐘', '母乳 左'],
     ['副食品 30g 南瓜粥', 30, 'g', '副食品 南瓜粥'],
-    ['喝奶', null, null, '喝奶'],
+    ['喝奶 不記量', null, null, '喝奶'],
     ['喝奶 １２０', 120, 'ml', '喝奶'],
   ];
   for (const [text, value, unit, detail] of cases) {
@@ -257,6 +257,10 @@ test('doPost 回覆 LINE 訊息', () => {
   assert.equal(sent[0].url, 'https://api.line.me/v2/bot/message/reply');
   assert.match(sent[0].body.messages[0].text, /喝奶 90ml/);
   assert.equal(sent[0].body.messages[0].quickReply.items.length, 11);
+  // 只打「餵奶」會用按鈕問種類
+  ctx.doPost({ postData: { contents: JSON.stringify({ events: [event('餵奶')] }) } });
+  const items = sent[1].body.messages[0].quickReply.items.map((i) => i.action.text);
+  assert.deepEqual(items, ['母乳', '瓶餵母乳', '配方奶', '副食品']);
   assert.equal(ss.sheets['紀錄'].rows[1][1], 'G1');
   // LINE 的 Verify 會送空的 events
   assert.equal(ctx.doPost({ postData: { contents: '{"events":[]}' } }), 'OK');
@@ -419,4 +423,51 @@ test('預測會分開白天和夜間的間隔', () => {
   assert.match(reply, /預計下一餐：約 06:00/);
   reply = svc.handle(CHAT, '喝奶 120', 'U', at(6, 0, 7));
   assert.match(reply, /預計下一餐：約 08:30/); // 06:00 是白天，用 2.5 小時
+});
+
+test('用按鈕選擇餵奶種類與份量', () => {
+  const { svc, ss } = newService();
+  // 第一步：選種類
+  const step1 = svc.handle(CHAT, '餵奶', 'U', at(8, 0));
+  assert.match(step1.text, /要記錄哪一種/);
+  assert.deepEqual(Array.from(step1.quick, (q) => q[0]), ['🤱 親餵', '🍼 瓶餵母乳', '🥛 配方奶', '🥣 副食品']);
+  assert.equal(ss.sheets['紀錄'].rows.length, 1); // 還沒記錄任何東西
+
+  // 第二步：沒有紀錄時給預設份量
+  const step2 = svc.handle(CHAT, step1.quick[2][1], 'U', at(8, 0));
+  assert.match(step2.text, /配方奶喝了多少/);
+  assert.deepEqual(Array.from(step2.quick, (q) => q[1]),
+    ['配方奶 60', '配方奶 90', '配方奶 120', '配方奶 150', '配方奶 180', '配方奶 210', '配方奶 240', '配方奶 不記量']);
+
+  // 第三步：點份量就記錄
+  assert.match(svc.handle(CHAT, '配方奶 120', 'U', at(8, 0)), /🍼 08:00 配方奶 120ml/);
+
+  // 下一次以上次的量為中心，並標上 ⭐
+  const again = svc.handle(CHAT, '配方奶', 'U', at(11, 0));
+  assert.match(again.text, /上次喝 120ml/);
+  assert.deepEqual(Array.from(again.quick, (q) => q[0]),
+    ['90ml', '100ml', '110ml', '⭐ 120ml', '130ml', '140ml', '150ml', '✔️ 不記量']);
+  // 瓶餵母乳的上次量分開算
+  assert.doesNotMatch(svc.handle(CHAT, '瓶餵母乳', 'U', at(11, 0)).text, /上次/);
+
+  // 不記量
+  assert.match(svc.handle(CHAT, '配方奶 不記量', 'U', at(11, 0)), /🍼 11:00 配方奶$/m);
+});
+
+test('親餵用按鈕選邊和時間', () => {
+  const { svc } = newService();
+  const r = svc.handle(CHAT, '母乳', 'U', at(8, 0));
+  assert.match(r.text, /親餵哪一邊、多久/);
+  assert.equal(r.quick.length, 9);
+  assert.deepEqual(Array.from(r.quick[0]), ['👈 左 10分', '母乳 左 10']);
+  assert.match(svc.handle(CHAT, r.quick[0][1], 'U', at(8, 0)), /母乳 左 10分鐘/);
+});
+
+test('有指定時間時按鈕會帶著時間', () => {
+  const { svc } = newService();
+  const r = svc.handle(CHAT, '14:30 餵奶', 'U', NOW);
+  assert.equal(r.quick[2][1], '14:30 配方奶');
+  const r2 = svc.handle(CHAT, r.quick[2][1], 'U', NOW);
+  assert.equal(r2.quick[0][1], '14:30 配方奶 60');
+  assert.match(svc.handle(CHAT, r2.quick[0][1], 'U', NOW), /🍼 14:30 配方奶 60ml/);
 });

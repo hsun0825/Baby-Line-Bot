@@ -75,8 +75,10 @@ function handleEvent(service, event) {
     return;
   }
   if (event.type !== 'message' || !event.message || event.message.type !== 'text') return;
-  const text = service.handle(chatIdOf(event.source), event.message.text, event.source.userId || '');
-  if (text) replyText(event.replyToken, text);
+  const reply = service.handle(chatIdOf(event.source), event.message.text, event.source.userId || '');
+  if (!reply) return;
+  if (typeof reply === 'string') replyText(event.replyToken, reply);
+  else replyText(event.replyToken, reply.text, reply.quick);
 }
 
 // 群組／聊天室共用同一份紀錄，讓爸媽一起記；一對一聊天則以使用者為單位
@@ -86,7 +88,7 @@ function chatIdOf(source) {
 
 // 每則回覆下方的快速按鈕（LINE 最多 13 個）
 const QUICK_ACTIONS = [
-  ['🍼 喝奶', '喝奶'],
+  ['🍼 餵奶', '餵奶'],
   ['😴 睡覺', '睡覺'],
   ['☀️ 起床', '起床'],
   ['💧 尿', '尿布 尿'],
@@ -99,14 +101,15 @@ const QUICK_ACTIONS = [
   ['↩️ 復原', '復原'],
 ];
 
-function replyText(replyToken, text) {
+/** quick 是快速按鈕 [[標籤, 送出的文字], ...]，沒給就用預設的 QUICK_ACTIONS */
+function replyText(replyToken, text, quick) {
   const payload = {
     replyToken: replyToken,
     messages: [{
       type: 'text',
       text: text.slice(0, 5000),
       quickReply: {
-        items: QUICK_ACTIONS.map(function (a) {
+        items: (quick || QUICK_ACTIONS).slice(0, 13).map(function (a) {
           return { type: 'action', action: { type: 'message', label: a[0], text: a[1] } };
         }),
       },
@@ -200,8 +203,9 @@ const SLEEP_START_WORDS = ['睡覺', '睡著', '睡了', '入睡', '開始睡', 
 const SLEEP_END_WORDS = ['起床', '醒了', '醒來', '睡醒', '醒'];
 const FEED_WORDS = {
   母乳: '母乳', 親餵: '母乳', 瓶餵母乳: '瓶餵母乳', 瓶餵: '瓶餵', 配方奶: '配方奶', 配方: '配方奶',
-  喝奶: '喝奶', 吃奶: '喝奶', 奶: '喝奶', 副食品: '副食品', 吃飯: '副食品', 吃: '副食品',
+  喝奶: '喝奶', 餵奶: '喝奶', 吃奶: '喝奶', 奶: '喝奶', 副食品: '副食品', 吃飯: '副食品', 吃: '副食品',
 };
+const SKIP_AMOUNT = '不記量';
 const DIAPER_WORDS = ['換尿布', '尿布', '排泄'];
 const TEMP_WORDS = ['體溫', '溫度', '量體溫'];
 const NOTE_WORDS = ['備註', '備忘', '筆記', '記事'];
@@ -291,6 +295,13 @@ function record(kind, at, fields) {
 
 function parseFeed(word, rest, at) {
   const kind = FEED_WORDS[word];
+  const skipAmount = rest.indexOf(SKIP_AMOUNT) >= 0;
+  rest = rest.replace(SKIP_AMOUNT, ' ');
+  // 只打「餵奶」或「配方奶」沒有其他內容：用按鈕問種類或份量
+  if (!skipAmount && !rest.trim()) {
+    if (kind === '喝奶') return { action: 'ask_feed_type', at: at };
+    return { action: 'ask_feed_amount', feedKind: kind, word: word, at: at };
+  }
   const cmd = record(FEED, at);
   let side = null;
   const sides = [['左右', '左右'], ['雙邊', '左右'], ['左', '左'], ['右', '右']];
@@ -682,7 +693,8 @@ const HELP_TEXT = [
   '【睡眠】睡覺 → 起床（自動算睡多久）',
   '補登：睡 13:00-14:30',
   '',
-  '【吃】喝奶 120 / 配方奶 150ml',
+  '【吃】點「🍼 餵奶」按鈕，選種類和份量就好',
+  '也可以直接打：配方奶 150 / 瓶餵母乳 90',
   '母乳 左 15（分鐘）/ 副食品 30g',
   '記錄後會預測下一餐時間和奶量 🔮',
   '',
@@ -909,6 +921,68 @@ BabyService.prototype.afterRecord = function (chatId, rec, now) {
   }
 
   return lines.join('\n');
+};
+
+// 有指定時間（例如「14:30 餵奶」）時，按鈕送出的文字也要帶著時間
+function timePrefix(cmd) {
+  return cmd.explicitTime ? fmtTime(cmd.at) + ' ' : '';
+}
+
+BabyService.prototype.do_ask_feed_type = function (chatId, cmd) {
+  const p = timePrefix(cmd);
+  return {
+    text: '🍼 ' + p + '要記錄哪一種？\n點下面的按鈕選擇 👇',
+    quick: [
+      ['🤱 親餵', p + '母乳'],
+      ['🍼 瓶餵母乳', p + '瓶餵母乳'],
+      ['🥛 配方奶', p + '配方奶'],
+      ['🥣 副食品', p + '副食品'],
+    ],
+  };
+};
+
+BabyService.prototype.do_ask_feed_amount = function (chatId, cmd) {
+  const p = timePrefix(cmd);
+  const kind = cmd.feedKind;
+  const skip = ['✔️ 不記量', p + kind + ' ' + SKIP_AMOUNT];
+
+  if (kind === '母乳') {
+    const quick = [];
+    [['👈 左', '左'], ['👉 右', '右']].forEach(function (side) {
+      [10, 15, 20].forEach(function (min) {
+        quick.push([side[0] + ' ' + min + '分', p + '母乳 ' + side[1] + ' ' + min]);
+      });
+    });
+    quick.push(['🤲 雙邊 20分', p + '母乳 雙邊 20'], ['🤲 雙邊 30分', p + '母乳 雙邊 30'], skip);
+    return { text: '🤱 親餵哪一邊、多久？\n（其他時間直接打，例如：母乳 左 12）', quick: quick };
+  }
+
+  const solid = kind === '副食品';
+  const unit = solid ? 'g' : 'ml';
+  const last = latest(this.storage.ofKind(chatId, FEED).filter(function (r) {
+    return r.unit === unit && r.value && r.detail.split(' ')[0] === kind;
+  }));
+  const step = 10;
+  let amounts;
+  if (last) {
+    const center = Math.round(last.value / step) * step;
+    amounts = [-30, -20, -10, 0, 10, 20, 30].map(function (d) { return center + d; })
+      .filter(function (v) { return v > 0; });
+  } else {
+    amounts = solid ? [10, 20, 30, 50, 80, 100, 150] : [60, 90, 120, 150, 180, 210, 240];
+  }
+  const quick = amounts.map(function (v) {
+    const isLast = last && v === Math.round(last.value / step) * step;
+    return [(isLast ? '⭐ ' : '') + v + unit, p + kind + ' ' + v];
+  });
+  quick.push(skip);
+  const icon = solid ? '🥣 ' : kind === '配方奶' ? '🥛 ' : '🍼 ';
+  return {
+    text: icon + kind + (solid ? '吃' : '喝') + '了多少？' +
+      (last ? '\n上次' + (solid ? '吃' : '喝') + ' ' + fmtValue(last.value, last.unit) + '（⭐）' : '') +
+      '\n（其他份量直接打，例如：' + kind + ' ' + (solid ? 45 : 135) + '）',
+    quick: quick,
+  };
 };
 
 BabyService.prototype.do_sleep_start = function (chatId, cmd, userId, now) {
