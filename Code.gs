@@ -5,18 +5,21 @@
  * 安裝方式請看 README.md。
  */
 
-// ======== 設定：只需要改這裡 ========
+// ======== 設定：第一次安裝時填這裡 ========
 
 // LINE Developers Console > Messaging API > Channel access token
+// 執行一次 setup 之後 token 會存進「指令碼屬性」，以後更新程式時這行不用再填。
 const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 
 // ===================================
 
+const TOKEN_PLACEHOLDER = '把你的 Channel access token 貼在這裡';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
 const GROWTH_SHEET_NAME = '成長曲線';
 const HEADERS = ['編號', '聊天室', '類型', '開始時間', '結束時間', '數值', '單位', '內容', '記錄者', '建立時間'];
+const WEB_RECORDER = '網頁補登';
 
 const SLEEP = 'sleep';
 const FEED = 'feed';
@@ -38,6 +41,94 @@ const KIND_LABELS = {
 const LABEL_KINDS = {};
 Object.keys(KIND_LABELS).forEach(function (k) { LABEL_KINDS[KIND_LABELS[k]] = k; });
 
+// ======== 指令碼屬性（token、寶寶資料、報表連結、記錄者名字） ========
+
+function props() {
+  return typeof PropertiesService === 'undefined' ? null : PropertiesService.getScriptProperties();
+}
+
+/** 程式最上面有填 token 就用它（並存起來）；沒填就用之前存起來的 */
+function lineToken() {
+  const p = props();
+  if (LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_ACCESS_TOKEN !== TOKEN_PLACEHOLDER) {
+    if (p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN') !== LINE_CHANNEL_ACCESS_TOKEN) {
+      p.setProperty('LINE_CHANNEL_ACCESS_TOKEN', LINE_CHANNEL_ACCESS_TOKEN);
+    }
+    return LINE_CHANNEL_ACCESS_TOKEN;
+  }
+  return (p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN')) || '';
+}
+
+function getBabyInfo(chatId) {
+  const p = props();
+  const raw = p && p.getProperty('baby:' + chatId);
+  return raw ? JSON.parse(raw) : {};
+}
+
+function setBabyInfo(chatId, info) {
+  const p = props();
+  if (p) p.setProperty('baby:' + chatId, JSON.stringify(info));
+}
+
+/** 每個聊天室一組隨機的報表密碼，拿到連結的人才看得到這個聊天室的紀錄 */
+function reportKey(chatId) {
+  const p = props();
+  if (!p) return null;
+  let key = p.getProperty('report:' + chatId);
+  if (!key) {
+    key = Utilities.getUuid().replace(/-/g, '');
+    p.setProperty('report:' + chatId, key);
+    p.setProperty('reportkey:' + key, chatId);
+  }
+  return key;
+}
+
+function chatForReportKey(key) {
+  const p = props();
+  if (!p || !key || !/^[0-9a-f]{32}$/.test(key)) return null;
+  return p.getProperty('reportkey:' + key);
+}
+
+function webAppUrl() {
+  const p = props();
+  const saved = p && p.getProperty('WEB_APP_URL');
+  if (saved) return saved;
+  try {
+    return typeof ScriptApp === 'undefined' ? '' : ScriptApp.getService().getUrl() || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function reportUrl(chatId) {
+  const base = webAppUrl();
+  const key = base && reportKey(chatId);
+  return key ? base + '?r=' + key : '';
+}
+
+/** 記錄者的 LINE 顯示名稱（查過一次就記起來）；查不到就用 userId */
+function recorderName(source) {
+  const userId = source && source.userId;
+  if (!userId) return '';
+  const p = props();
+  const cached = p && p.getProperty('name:' + userId);
+  if (cached) return cached;
+  let url = 'https://api.line.me/v2/bot/profile/' + userId;
+  if (source.groupId) url = 'https://api.line.me/v2/bot/group/' + source.groupId + '/member/' + userId;
+  else if (source.roomId) url = 'https://api.line.me/v2/bot/room/' + source.roomId + '/member/' + userId;
+  try {
+    const res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + lineToken() }, muteHttpExceptions: true });
+    const name = res.getResponseCode() === 200 ? JSON.parse(res.getContentText()).displayName : '';
+    if (name) {
+      if (p) p.setProperty('name:' + userId, name);
+      return name;
+    }
+  } catch (e) {
+    console.error('查詢 LINE 名稱失敗：' + e);
+  }
+  return userId;
+}
+
 // ======== LINE webhook 入口 ========
 
 function doPost(e) {
@@ -54,19 +145,88 @@ function doPost(e) {
   return ContentService.createTextOutput('OK');
 }
 
-// 第一次安裝時在編輯器裡執行一次：建立「紀錄」工作表，並授權程式使用試算表和連網
+// 第一次安裝時在編輯器裡執行一次：建立「紀錄」工作表、存好 token，並授權程式使用試算表和連網
 function setup() {
   new SheetStorage();
+  const token = lineToken();
+  if (!token) throw new Error('請先把 Channel access token 貼到程式最上面，再執行一次 setup。');
   UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
-    headers: { Authorization: 'Bearer ' + LINE_CHANNEL_ACCESS_TOKEN },
+    headers: { Authorization: 'Bearer ' + token },
     muteHttpExceptions: true,
   });
-  console.log('設定完成！接下來請按「部署」。');
+  console.log('設定完成！token 已經存起來，以後更新程式不用再填。接下來請按「部署」。');
 }
 
-// 用瀏覽器打開部署網址時會看到這個，用來確認部署成功
-function doGet() {
-  return ContentService.createTextOutput('寶寶紀錄 bot 運作中 👶');
+// 用瀏覽器打開部署網址會看到「運作中」；帶著報表密碼（?r=...）則是寶寶作息報表
+function doGet(e) {
+  const key = e && e.parameter && e.parameter.r;
+  if (!key) return ContentService.createTextOutput('寶寶紀錄 bot 運作中 👶');
+  const chatId = chatForReportKey(key);
+  if (!chatId) {
+    return HtmlService.createHtmlOutput('<p style="font:16px sans-serif;padding:16px">這個報表連結已經失效了，請在 LINE 裡輸入「報表」拿新的連結。</p>')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+  const service = new BabyService(new SheetStorage());
+  return HtmlService.createHtmlOutput(reportHtml(key, service.reportData(chatId, new Date())))
+    .setTitle('寶寶作息報表')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/** 報表網頁的「補登」按鈕會呼叫這裡（google.script.run） */
+function webAddRecord(key, form) {
+  const chatId = chatForReportKey(key);
+  if (!chatId) return { ok: false, message: '這個報表連結已經失效了，請在 LINE 裡輸入「報表」拿新的連結。' };
+  const now = new Date();
+  let text;
+  try {
+    text = webFormToText(form);
+    const cmd = parseCommand(text, now);
+    if (!cmd || (cmd.action !== 'record' && cmd.action !== 'sleep_range')) return { ok: false, message: '看不懂要補登的內容，請再檢查一次。' };
+  } catch (e) {
+    if (e instanceof ParseError) return { ok: false, message: e.message };
+    throw e;
+  }
+  const service = new BabyService(new SheetStorage());
+  const reply = service.handle(chatId, text, WEB_RECORDER, now);
+  const message = typeof reply === 'string' ? reply : (reply && reply.text) || '';
+  if (/^⚠️/.test(message)) return { ok: false, message: message.replace(/^⚠️\s*/, '') };
+  return { ok: true, message: message, data: service.reportData(chatId, now) };
+}
+
+/** 把網頁表單轉成跟 LINE 一樣的文字指令，讓兩邊用同一套解析和檢查 */
+function webFormToText(f) {
+  f = f || {};
+  const day = new Date(Number(f.day));
+  if (isNaN(day.getTime())) throw new ParseError('請選日期');
+  const date = fmtDate(day);
+  const time = /^\d{2}:\d{2}$/.test(f.time || '') ? f.time : null;
+  if (!time) throw new ParseError('請選時間');
+  const num = function (v, label) {
+    const n = Number(v);
+    if (!isFinite(n) || n <= 0) throw new ParseError('請填' + label);
+    return n;
+  };
+  switch (f.kind) {
+    case 'feed': {
+      const types = ['配方奶', '瓶餵母乳', '母乳', '副食品'];
+      if (types.indexOf(f.feedType) < 0) throw new ParseError('請選餵食種類');
+      return date + ' ' + time + ' ' + f.feedType + ' ' + num(f.amount, '份量');
+    }
+    case 'sleep':
+      if (!/^\d{2}:\d{2}$/.test(f.end || '')) throw new ParseError('請選醒來時間');
+      return date + ' 睡 ' + time + '-' + f.end;
+    case 'diaper': {
+      const label = { pee: '尿', poo: '便', both: '尿+便' }[f.diaper];
+      if (!label) throw new ParseError('請選尿或便');
+      return date + ' ' + time + ' 尿布 ' + label;
+    }
+    case 'temp':
+      return date + ' ' + time + ' 體溫 ' + num(f.temp, '體溫');
+    case 'weight':
+      return date + ' ' + time + ' 體重 ' + num(f.kg, '體重');
+    default:
+      throw new ParseError('請選要補登的類型');
+  }
 }
 
 function handleEvent(service, event) {
@@ -75,10 +235,15 @@ function handleEvent(service, event) {
     return;
   }
   if (event.type !== 'message' || !event.message || event.message.type !== 'text') return;
-  const reply = service.handle(chatIdOf(event.source), event.message.text, event.source.userId || '');
-  if (!reply) return;
-  if (typeof reply === 'string') replyText(event.replyToken, reply);
-  else replyText(event.replyToken, reply.text, reply.quick);
+  const source = event.source || {};
+  // 名字只在真的要記錄時才查（傳函式進去，看不懂的聊天訊息就不會多打一次 LINE API）
+  const reply = service.handle(chatIdOf(source), event.message.text, function () { return recorderName(source); });
+  if (!reply) {
+    // 群組裡看不懂就安靜；一對一聊天時提示一下，免得以為已經記好了
+    if (source.type === 'user') replyText(event.replyToken, '🤔 看不懂這則訊息，所以沒有記錄。\n輸入「說明」可以看所有指令。');
+    return;
+  }
+  replyMessage(event.replyToken, reply);
 }
 
 // 群組／聊天室共用同一份紀錄，讓爸媽一起記；一對一聊天則以使用者為單位
@@ -96,30 +261,35 @@ const QUICK_ACTIONS = [
   ['🛁 洗澡', '洗澡'],
   ['⏱️ 狀態', '狀態'],
   ['📊 今天', '今天'],
+  ['📈 報表', '報表'],
   ['📋 最近', '最近'],
   ['📏 成長', '成長紀錄'],
   ['↩️ 復原', '復原'],
 ];
 
+/** reply 可以是文字、{ text, quick }，或 { flex, altText, quick }（圖卡） */
+function replyMessage(replyToken, reply) {
+  if (typeof reply === 'string') return replyText(replyToken, reply);
+  if (reply.flex) return sendReply(replyToken, { type: 'flex', altText: reply.altText, contents: reply.flex }, reply.quick);
+  return replyText(replyToken, reply.text, reply.quick);
+}
+
 /** quick 是快速按鈕 [[標籤, 送出的文字], ...]，沒給就用預設的 QUICK_ACTIONS */
 function replyText(replyToken, text, quick) {
-  const payload = {
-    replyToken: replyToken,
-    messages: [{
-      type: 'text',
-      text: text.slice(0, 5000),
-      quickReply: {
-        items: (quick || QUICK_ACTIONS).slice(0, 13).map(function (a) {
-          return { type: 'action', action: { type: 'message', label: a[0], text: a[1] } };
-        }),
-      },
-    }],
+  return sendReply(replyToken, { type: 'text', text: text.slice(0, 5000) }, quick);
+}
+
+function sendReply(replyToken, message, quick) {
+  message.quickReply = {
+    items: (quick || QUICK_ACTIONS).slice(0, 13).map(function (a) {
+      return { type: 'action', action: { type: 'message', label: a[0], text: a[1] } };
+    }),
   };
   const res = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'post',
     contentType: 'application/json',
-    headers: { Authorization: 'Bearer ' + LINE_CHANNEL_ACCESS_TOKEN },
-    payload: JSON.stringify(payload),
+    headers: { Authorization: 'Bearer ' + lineToken() },
+    payload: JSON.stringify({ replyToken: replyToken, messages: [message] }),
     muteHttpExceptions: true,
   });
   if (res.getResponseCode() !== 200) {
@@ -171,6 +341,12 @@ function fmtFullDate(date) {
   return p.y + '/' + pad2(p.mo + 1) + '/' + pad2(p.d);
 }
 
+const WEEKDAYS = '日一二三四五六';
+
+function fmtWeekday(date) {
+  return WEEKDAYS[new Date(date.getTime() + TZ_OFFSET_HOURS * 3600000).getUTCDay()];
+}
+
 function fmtDuration(ms) {
   const minutes = Math.max(0, Math.floor(ms / 60000));
   const h = Math.floor(minutes / 60);
@@ -217,9 +393,12 @@ const VACCINE_WORDS = ['打疫苗', '疫苗', '預防針', '打針'];
 const CLINIC_WORDS = ['看診', '看醫生', '就醫', '門診', '回診'];
 const EDIT_WORDS = ['修改', '更正'];
 const EXPORT_WORDS = ['匯出', '導出'];
+const SETTING_WORDS = ['設定', '設置'];
 
 const QUERY_WORDS = {
   今天: 'today', 今日: 'today', 昨天: 'yesterday', 昨日: 'yesterday',
+  今天明細: 'today_detail', 今日明細: 'today_detail', 昨天明細: 'yesterday_detail', 昨日明細: 'yesterday_detail',
+  報表: 'report', 圖表: 'report', 報告: 'report',
   最近: 'recent', 紀錄: 'recent', 記錄: 'recent', 歷史: 'recent',
   狀態: 'status', 現在: 'status', 多久: 'status',
   刪除: 'undo', 復原: 'undo', 取消: 'undo', 刪除上一筆: 'undo',
@@ -467,8 +646,34 @@ function parseSleepRange(text, now) {
   return { action: 'sleep_range', kind: SLEEP, at: start, end: end, explicitTime: true };
 }
 
-/** 解析一筆紀錄（不含查詢指令）。explicitTime 表示使用者有指定時間。 */
+/** 「10/6 14:30 喝奶 120」這種開頭有日期的寫法：回傳那天 00:00 和剩下的文字 */
+function stripDate(text, now) {
+  const m = text.match(/^(\d{1,2})\/(\d{1,2})\s+(.+)$/);
+  if (!m) return null;
+  const mo = Number(m[1]) - 1;
+  const d = Number(m[2]);
+  const p = localParts(now);
+  let day = makeLocal(p.y, mo, d, 0, 0);
+  if (mo > 11 || d < 1 || localParts(day).d !== d) return null; // 不是日期（例如聊天時打的「3/40」）就不理會
+  if (day > now) day = makeLocal(p.y - 1, mo, d, 0, 0); // 比今天晚的日期當作去年
+  return { day: day, body: m[3] };
+}
+
+/** 解析一筆紀錄（不含查詢指令）。explicitTime 表示使用者有指定時間，dated 表示有指定日期。 */
 function parseRecord(text, now) {
+  const dated = stripDate(text, now);
+  if (!dated) return parseRecordAt(text, now);
+  // 以那天的 23:59 為基準解析時間，時間就不會被當成前一天
+  const cmd = parseRecordAt(dated.body, addMinutes(dated.day, 24 * 60 - 1));
+  if (!cmd) return null;
+  if (!cmd.explicitTime) throw new ParseError('補登其他天的紀錄要加上時間，例如：' + fmtDate(dated.day) + ' 14:30 配方奶 120');
+  const latestAllowed = addMinutes(now, 5);
+  if (cmd.at > latestAllowed || (cmd.end && cmd.end > latestAllowed)) throw new ParseError('時間比現在晚，請確認日期和時間');
+  cmd.dated = true;
+  return cmd;
+}
+
+function parseRecordAt(text, now) {
   const range = parseSleepRange(text, now);
   if (range) return range;
   const st = stripTime(text, now);
@@ -476,6 +681,26 @@ function parseRecord(text, now) {
   const cmd = parseBody(st.body, st.at || now);
   if (cmd) cmd.explicitTime = !!st.at;
   return cmd;
+}
+
+/** 「設定 生日 2026/8/5」、「設定 性別 女」、「設定 名字 小寶」；只打「設定」就顯示目前的設定 */
+function parseSetting(rest) {
+  rest = rest.trim();
+  if (!rest) return { action: 'settings' };
+  let m = rest.match(/^(生日|出生日期|出生)\s*(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})日?$/);
+  if (m) {
+    const y = Number(m[2]);
+    const mo = Number(m[3]) - 1;
+    const d = Number(m[4]);
+    const birth = makeLocal(y, mo, d, 0, 0);
+    if (mo > 11 || localParts(birth).d !== d) throw new ParseError('生日日期不正確，例如：設定 生日 2026/8/5');
+    return { action: 'settings', field: 'birth', value: birth.getTime() };
+  }
+  m = rest.match(/^性別\s*(男|女)/);
+  if (m) return { action: 'settings', field: 'sex', value: m[1] };
+  m = rest.match(/^(名字|暱稱|小名)\s*(.+)$/);
+  if (m) return { action: 'settings', field: 'name', value: m[2].trim().slice(0, 20) };
+  throw new ParseError('可以設定的項目：\n設定 生日 2026/8/5\n設定 性別 男（或 女）\n設定 名字 小寶');
 }
 
 /** 解析一則訊息。看不懂就回傳 null（機器人不回應，避免在群組裡吵）。 */
@@ -494,6 +719,9 @@ function parseCommand(rawText, now) {
     if (days < 1 || days > 366) throw new ParseError('匯出天數請在 1～366 天之間，例如：匯出 30');
     return { action: 'export', days: days };
   }
+
+  word = startsWithWord(text, SETTING_WORDS);
+  if (word) return parseSetting(text.slice(word.length));
 
   word = startsWithWord(text, EDIT_WORDS);
   if (word) {
@@ -710,9 +938,13 @@ const HELP_TEXT = [
   '',
   '【補登時間】前面或後面加時間：',
   '14:30 喝奶 120 / 尿布 便 09:15',
+  '其他天的話前面加日期：10/6 14:30 配方奶 120',
+  '忘了按起床：起床 07:30',
   '',
   '【查詢】',
-  '今天 / 昨天 → 當日統計',
+  '今天 / 昨天 → 當日統計圖卡',
+  '今天明細 / 昨天明細 → 每一筆紀錄',
+  '報表 → 作息圖、趨勢、成長曲線網頁（也能補登）',
   '最近 → 最近 10 筆',
   '狀態 → 距離上次吃、睡、換尿布多久',
   '成長紀錄 → 身高體重變化',
@@ -725,6 +957,9 @@ const HELP_TEXT = [
   '復原 → 刪除最後一筆',
   '',
   '【匯出】匯出 / 匯出 30 → 最近 7 天或 30 天整理成試算表',
+  '',
+  '【寶寶資料】設定 生日 2026/8/5 / 設定 性別 女 / 設定 名字 小寶',
+  '（設定後，報表的體重曲線會對照 WHO 標準）',
   '',
   '成長曲線圖在試算表的「成長曲線」分頁 📈',
 ].join('\n');
@@ -795,6 +1030,7 @@ BabyService.prototype.handle = function (chatId, text, userId, now) {
     throw e;
   }
   if (!cmd) return null;
+  if (typeof userId === 'function') userId = userId();
   const self = this;
   // 兩個人同時記錄時避免互相覆蓋
   return withLock(function () {
@@ -857,9 +1093,19 @@ function describePrediction(p) {
 BabyService.prototype.do_record = function (chatId, cmd, userId, now) {
   const rec = this.storage.add(chatId, cmd.kind, cmd.at,
     { value: cmd.value, unit: cmd.unit, detail: cmd.detail, userId: userId });
-  let reply = '✅ 已記錄\n' + describe(rec, now);
+  let reply = '✅ 已記錄' + (cmd.dated ? '（' + fmtDate(rec.start) + '）' : '') + '\n' + describe(rec, now);
   const extra = this.afterRecord(chatId, rec, now);
-  return extra ? reply + '\n' + extra : reply;
+  if (extra) reply += '\n' + extra;
+  const forgot = this.forgotWakeReminder(chatId, rec, now);
+  return forgot ? reply + '\n\n' + forgot : reply;
+};
+
+/** 睡眠開著超過 6 小時又記了別的東西，多半是忘了按「起床」 */
+BabyService.prototype.forgotWakeReminder = function (chatId, rec, now) {
+  const opened = this.storage.openSleep(chatId);
+  if (!opened || rec.start <= opened.start || now - opened.start < 6 * 3600000) return '';
+  return '⚠️ 寶寶從 ' + fmtDate(opened.start) + ' ' + fmtTime(opened.start) + ' 睡到現在還沒記「起床」（已 ' +
+    fmtDuration(now - opened.start) + '）。\n如果早就醒了，輸入「起床 07:30」補上起床時間。';
 };
 
 /** 記錄後附加的資訊：距離上一餐、預測、體重變化、發燒提醒…… */
@@ -880,9 +1126,13 @@ BabyService.prototype.afterRecord = function (chatId, rec, now) {
   if (rec.kind === FEED) {
     const prev = previous(FEED);
     if (prev.length) lines.push('距離上一餐 ' + fmtDuration(rec.start - prev[prev.length - 1].start));
-    const p = this.predictNextFeed(chatId, rec);
-    lines.push('');
-    lines.push(p ? describePrediction(p) : '🔮 再多記錄幾餐（約 1～2 天），就會開始預測下一餐');
+    // 補登比較早的餐就不預測（預測要以最新的一餐為準）
+    const isLatest = !s.ofKind(chatId, FEED).some(function (r) { return r.start > rec.start; });
+    if (isLatest) {
+      const p = this.predictNextFeed(chatId, rec);
+      lines.push('');
+      lines.push(p ? describePrediction(p) : '🔮 再多記錄幾餐（約 1～2 天），就會開始預測下一餐');
+    }
   }
 
   if (rec.kind === GROWTH) {
@@ -925,7 +1175,8 @@ BabyService.prototype.afterRecord = function (chatId, rec, now) {
 
 // 有指定時間（例如「14:30 餵奶」）時，按鈕送出的文字也要帶著時間
 function timePrefix(cmd) {
-  return cmd.explicitTime ? fmtTime(cmd.at) + ' ' : '';
+  if (!cmd.explicitTime) return '';
+  return (cmd.dated ? fmtDate(cmd.at) + ' ' : '') + fmtTime(cmd.at) + ' ';
 }
 
 BabyService.prototype.do_ask_feed_type = function (chatId, cmd) {
@@ -1006,8 +1257,15 @@ BabyService.prototype.do_sleep_end = function (chatId, cmd, userId, now) {
 };
 
 BabyService.prototype.do_sleep_range = function (chatId, cmd, userId, now) {
+  const clash = latest(this.storage.ofKind(chatId, SLEEP).filter(function (r) {
+    return r.start < cmd.end && (r.end || now) > cmd.at;
+  }));
+  if (clash) {
+    return '⚠️ 這段睡眠跟已經記的「' + describe(clash, now).replace(/^😴 /, '') + '」重疊了，請確認時間。' +
+      (clash.end ? '' : '\n（寶寶還在睡的話，醒來時輸入「起床」就好）');
+  }
   const rec = this.storage.add(chatId, SLEEP, cmd.at, { end: cmd.end, userId: userId });
-  return '✅ 已補登\n' + describe(rec, now);
+  return '✅ 已補登（' + fmtDate(rec.start) + '）\n' + describe(rec, now);
 };
 
 BabyService.prototype.do_edit = function (chatId, cmd, userId, now) {
@@ -1133,10 +1391,18 @@ BabyService.prototype.do_status = function (chatId, cmd, userId, now) {
 };
 
 BabyService.prototype.do_today = function (chatId, cmd, userId, now) {
-  return this.daySummary(chatId, startOfDay(now), now);
+  return this.dayCard(chatId, startOfDay(now), now, '今天');
 };
 
 BabyService.prototype.do_yesterday = function (chatId, cmd, userId, now) {
+  return this.dayCard(chatId, addMinutes(startOfDay(now), -24 * 60), now, '昨天');
+};
+
+BabyService.prototype.do_today_detail = function (chatId, cmd, userId, now) {
+  return this.daySummary(chatId, startOfDay(now), now);
+};
+
+BabyService.prototype.do_yesterday_detail = function (chatId, cmd, userId, now) {
   return this.daySummary(chatId, addMinutes(startOfDay(now), -24 * 60), now);
 };
 
@@ -1220,3 +1486,831 @@ BabyService.prototype.do_export = function (chatId, cmd, userId, now) {
   return '📤 已匯出最近 ' + cmd.days + ' 天（' + (detail.length - 1) + ' 筆紀錄）\n' + url +
     '\n\n檔案存在你的 Google 雲端硬碟。要給醫生看的話，打開後按「共用與匯出」可以下載成 PDF 或 Excel。';
 };
+
+// ======== 今日圖卡（LINE Flex Message） ========
+
+function flexRow(label, value) {
+  return {
+    type: 'box', layout: 'horizontal', spacing: 'md',
+    contents: [
+      { type: 'text', text: label, size: 'sm', color: '#666666', flex: 2 },
+      { type: 'text', text: value, size: 'sm', color: '#111111', weight: 'bold', align: 'end', wrap: true, flex: 5 },
+    ],
+  };
+}
+
+/** 「今天」、「昨天」：一張統計圖卡，下面有「看報表」和「看明細」按鈕 */
+BabyService.prototype.dayCard = function (chatId, start, now, label) {
+  const st = this.dayStats(chatId, start, now);
+  const title = '📊 ' + fmtDate(start) + '（' + fmtWeekday(start) + '）' + label;
+  if (!st.records.length) return title + '\n這天還沒有紀錄。';
+  const isToday = label === '今天';
+
+  const feed = [st.feeds + ' 次'];
+  if (st.ml) feed.push(fmtNum(st.ml) + 'ml');
+  if (st.breast) feed.push('親餵 ' + fmtNum(st.breast) + ' 分');
+  const rows = [
+    flexRow('🍼 餵食', feed.join(' · ')),
+    flexRow('😴 睡眠', fmtDuration(st.sleepMs) + '（' + st.sleeps + ' 段）'),
+    flexRow('🧷 尿布', '尿 ' + st.pee + ' · 便 ' + st.poo),
+  ];
+  if (st.temps) rows.push(flexRow('🌡️ 體溫', '最高 ' + fmtNum(st.maxTemp) + '°C' + (st.maxTemp >= 38 ? ' ⚠️' : '')));
+  if (st.pumps) rows.push(flexRow('🥛 擠奶', st.pumps + ' 次' + (st.pumpMl ? ' · ' + fmtNum(st.pumpMl) + 'ml' : '')));
+  if (st.meds) rows.push(flexRow('💊 吃藥', st.meds + ' 次'));
+  if (st.baths) rows.push(flexRow('🛁 洗澡', st.baths + ' 次'));
+
+  const body = [
+    { type: 'text', text: title, weight: 'bold', size: 'lg', wrap: true },
+    { type: 'text', text: isToday ? '統計到 ' + fmtTime(now) + ' 為止' : '全天統計', size: 'xs', color: '#999999' },
+    { type: 'separator', margin: 'md' },
+    { type: 'box', layout: 'vertical', spacing: 'sm', margin: 'md', contents: rows },
+  ];
+  if (isToday) {
+    const last = this.storage.lastOfKind(chatId, FEED);
+    const p = last && this.predictNextFeed(chatId, last);
+    if (p) {
+      body.push({ type: 'separator', margin: 'md' });
+      body.push({
+        type: 'text', margin: 'md', size: 'sm', wrap: true, color: '#111111',
+        text: '🔮 預計下一餐約 ' + fmtTime(p.at) + (p.amount ? '，約 ' + p.amount + 'ml' : ''),
+      });
+    }
+  }
+
+  const buttons = [];
+  const url = reportUrl(chatId);
+  if (url) buttons.push({ type: 'button', style: 'primary', color: '#2a78d6', height: 'sm', action: { type: 'uri', label: '📈 看完整報表', uri: url } });
+  buttons.push({ type: 'button', style: 'secondary', height: 'sm', action: { type: 'message', label: '📋 看明細', text: label + '明細' } });
+
+  return {
+    altText: title + '：餵食 ' + st.feeds + ' 次、睡眠 ' + fmtDuration(st.sleepMs) + '、尿布 ' + st.diapers + ' 次',
+    flex: {
+      type: 'bubble',
+      body: { type: 'box', layout: 'vertical', contents: body },
+      footer: { type: 'box', layout: 'vertical', spacing: 'sm', contents: buttons },
+    },
+  };
+};
+
+// ======== 寶寶設定與報表 ========
+
+BabyService.prototype.do_settings = function (chatId, cmd) {
+  const info = getBabyInfo(chatId);
+  if (cmd.field) {
+    info[cmd.field] = cmd.value;
+    setBabyInfo(chatId, info);
+  }
+  const lines = [cmd.field ? '✅ 已更新寶寶資料' : '👶 寶寶資料'];
+  lines.push('名字：' + (info.name || '（未設定）'));
+  lines.push('生日：' + (info.birth ? fmtFullDate(new Date(info.birth)) : '（未設定）'));
+  lines.push('性別：' + (info.sex || '（未設定）'));
+  if (!info.birth || !info.sex) {
+    lines.push('', '設定生日和性別後，報表的體重曲線會對照 WHO 標準：', '設定 生日 2026/8/5', '設定 性別 男（或 女）');
+  }
+  return lines.join('\n');
+};
+
+BabyService.prototype.do_report = function (chatId) {
+  const url = reportUrl(chatId);
+  if (!url) return '目前拿不到報表網址 🤔\n請確認 Apps Script 已經用「網頁應用程式」部署。';
+  return {
+    text: '📈 寶寶作息報表\n' + url + '\n\n可以看 24 小時作息圖、每日趨勢、成長曲線，也能補登漏記的紀錄。\n' +
+      '⚠️ 這個連結可以看和新增紀錄，請不要轉傳給其他人。',
+  };
+};
+
+/** 報表網頁需要的資料（時間都用毫秒，網頁再用台灣時間顯示） */
+BabyService.prototype.reportData = function (chatId, now) {
+  const s = this.storage;
+  const today = startOfDay(now);
+  const days = [];
+  for (let i = 29; i >= 0; i--) {
+    const start = addMinutes(today, -i * 24 * 60);
+    const st = this.dayStats(chatId, start, now);
+    const feeds = st.records.filter(function (r) { return r.kind === FEED && r.start >= start; });
+    let gapSum = 0;
+    for (let j = 1; j < feeds.length; j++) gapSum += feeds[j].start - feeds[j - 1].start;
+    days.push({
+      d0: start.getTime(), ml: st.ml, n: st.feeds, breast: st.breast, sleepH: Math.round(st.sleepMs / 36000) / 100,
+      gapH: feeds.length > 1 ? Math.round(gapSum / (feeds.length - 1) / 36000) / 100 : null, pee: st.pee, poo: st.poo,
+    });
+  }
+
+  // 作息圖：最近 7 天（多抓一天，才能找出跨日的漏記）
+  const recs = s.between(chatId, addMinutes(today, -7 * 24 * 60), addMinutes(now, 1));
+  const sleeps = [];
+  const feeds = [];
+  const diapers = [];
+  recs.forEach(function (r) {
+    if (r.kind === SLEEP) sleeps.push({ s: r.start.getTime(), e: (r.end || now).getTime(), ongoing: !r.end, web: r.userId === WEB_RECORDER });
+    if (r.kind === FEED) feeds.push({ t: r.start.getTime(), label: (r.detail + ' ' + fmtValue(r.value, r.unit)).trim(), web: r.userId === WEB_RECORDER });
+    if (r.kind === DIAPER) {
+      const label = r.detail.split(' ')[0];
+      if (label.indexOf('尿') >= 0) diapers.push({ t: r.start.getTime(), kind: 'pee', web: r.userId === WEB_RECORDER });
+      if (label.indexOf('便') >= 0) diapers.push({ t: r.start.getTime(), kind: 'poo', web: r.userId === WEB_RECORDER });
+    }
+  });
+
+  const lastFeed = s.lastOfKind(chatId, FEED);
+  const p = lastFeed && this.predictNextFeed(chatId, lastFeed);
+  const lastTemp = s.lastOfKind(chatId, TEMP);
+  const lastDiaper = s.lastOfKind(chatId, DIAPER);
+  return {
+    now: now.getTime(),
+    today: today.getTime(),
+    baby: getBabyInfo(chatId),
+    days: days,
+    sleeps: sleeps,
+    feeds: feeds,
+    diapers: diapers,
+    growth: s.ofKind(chatId, GROWTH).map(function (r) { return { t: r.start.getTime(), what: r.detail, v: r.value, unit: r.unit }; }),
+    lastFeed: lastFeed ? { t: lastFeed.start.getTime(), label: (lastFeed.detail + ' ' + fmtValue(lastFeed.value, lastFeed.unit)).trim() } : null,
+    lastTemp: lastTemp && lastTemp.value != null ? { t: lastTemp.start.getTime(), v: lastTemp.value } : null,
+    lastDiaper: lastDiaper ? { t: lastDiaper.start.getTime(), label: lastDiaper.detail } : null,
+    sleeping: !!s.openSleep(chatId),
+    prediction: p ? { at: p.at.getTime(), amount: p.amount } : null,
+  };
+};
+
+// ======== 報表網頁 ========
+
+/** 把資料放進報表網頁（JSON 裡的 < 先轉義，避免資料內容被當成 HTML） */
+function reportHtml(key, data) {
+  const json = JSON.stringify(data).replace(/</g, '\\u003c');
+  return REPORT_HTML
+    .replace('__KEY__', function () { return JSON.stringify(key); })
+    .replace('__DATA__', function () { return json; });
+}
+
+// 報表網頁本身（HTML + CSS + JavaScript）。用 String.raw 保留裡面的反斜線。
+const REPORT_HTML = String.raw`<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>寶寶作息報表</title>
+<style>
+:root {
+  --page: #f7f8f6; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --night: #eef1f6;
+  --accent: #2a78d6; --sleep: #2a78d6; --feed: #eb6834; --pee: #1baf7a; --poo: #eda100;
+  --band: rgba(42,120,214,0.08); --good: #006300; --chip-on: #0b0b0b; --chip-on-ink: #ffffff;
+  --warn: #b77a00; --warn-bg: rgba(250,178,25,0.10); --crit: #d03b3b;
+  --font: system-ui, -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Segoe UI", sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --night: #202329;
+    --accent: #3987e5; --sleep: #3987e5; --feed: #d95926; --pee: #199e70; --poo: #c98500;
+    --band: rgba(57,135,229,0.12); --good: #0ca30c; --chip-on: #ffffff; --chip-on-ink: #0b0b0b;
+    --warn: #fab219; --warn-bg: rgba(250,178,25,0.10); --crit: #e66767;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--page); color: var(--ink); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 560px; margin: 0 auto; padding: 16px 16px 90px; display: flex; flex-direction: column; gap: 16px; }
+header { display: flex; flex-direction: column; gap: 4px; }
+.eyebrow { color: var(--ink-2); font-size: 12px; letter-spacing: .04em; }
+h1 { font-size: 22px; margin: 0; font-weight: 700; }
+h2 { font-size: 15px; margin: 0; font-weight: 650; }
+.sub { color: var(--muted); font-size: 12px; margin: 0; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tile .k { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.tile .v { font-size: 24px; font-weight: 700; line-height: 1.2; }
+.tile .v small { font-size: 13px; font-weight: 500; color: var(--ink-2); margin-left: 2px; }
+.tile .d { font-size: 12px; color: var(--muted); }
+.tile.wide { grid-column: 1 / -1; flex-direction: row; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font: inherit; font-size: 12px; border: 1px solid var(--border); background: transparent; color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--chip-on); color: var(--chip-on-ink); border-color: var(--chip-on); }
+.chip:focus-visible, .btn:focus-visible, .seg button:focus-visible, .field input:focus-visible, .field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-family: var(--font); font-size: 10px; font-variant-numeric: tabular-nums; }
+svg text.rowlab { fill: var(--ink-2); font-size: 11px; }
+svg text.vlab { fill: var(--ink-2); }
+.mini { display: flex; flex-direction: column; gap: 4px; }
+.mini-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; color: var(--ink-2); gap: 8px; flex-wrap: wrap; }
+.mini-title b { color: var(--ink); font-size: 13px; }
+.tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px; line-height: 1.45; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 220px; white-space: pre-line; }
+details { font-size: 13px; }
+summary { cursor: pointer; color: var(--ink-2); }
+.tbl { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 12px; }
+th, td { padding: 5px 6px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--ink-2); font-weight: 600; }
+.note { font-size: 12px; color: var(--muted); margin: 0; }
+.btn { font: inherit; font-size: 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 8px 12px; cursor: pointer; }
+.btn.primary { background: var(--chip-on); color: var(--chip-on-ink); border-color: var(--chip-on); font-weight: 600; }
+.btn[disabled] { opacity: .6; cursor: progress; }
+.addbar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; pointer-events: none; z-index: 5; }
+.addbar .btn { pointer-events: auto; box-shadow: 0 4px 16px rgba(0,0,0,.18); border-radius: 999px; padding: 10px 20px; font-size: 14px; }
+.gaps { display: flex; flex-direction: column; gap: 6px; }
+.gap-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 8px 10px; border: 1px dashed var(--warn); border-radius: 8px; background: var(--warn-bg); }
+.gap-row b { font-weight: 600; }
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 20; display: flex; align-items: flex-end; justify-content: center; }
+.sheet { background: var(--surface); color: var(--ink); width: 100%; max-width: 560px; border-radius: 16px 16px 0 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 12px; max-height: 92%; overflow-y: auto; }
+.sheet-head { display: flex; justify-content: space-between; align-items: center; }
+.sheet-head h2 { font-size: 17px; }
+.x { font: inherit; font-size: 22px; line-height: 1; background: none; border: 0; color: var(--ink-2); cursor: pointer; padding: 4px 8px; }
+.seg { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 6px; }
+.seg.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.seg button { font: inherit; font-size: 12px; border: 1px solid var(--border); background: transparent; color: var(--ink); border-radius: 10px; padding: 8px 2px; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.seg button span { font-size: 18px; }
+.seg button[aria-pressed="true"] { border-color: var(--ink); background: var(--page); font-weight: 600; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; color: var(--ink-2); }
+.field.full { grid-column: 1 / -1; }
+.field input, .field select { font: inherit; font-size: 16px; color: var(--ink); background: var(--page); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%; min-width: 0; }
+.err { color: var(--crit); font-size: 13px; min-height: 1em; white-space: pre-line; }
+.preview-line { font-size: 13px; color: var(--ink-2); background: var(--page); border-radius: 8px; padding: 8px 10px; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(70px + env(safe-area-inset-bottom, 0px)); z-index: 30; background: var(--chip-on); color: var(--chip-on-ink); padding: 9px 14px; border-radius: 10px; font-size: 13px; max-width: calc(100% - 32px); box-shadow: 0 4px 16px rgba(0,0,0,.2); white-space: pre-line; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow" id="baby-line"></div>
+    <h1>寶寶作息報表</h1>
+    <p class="sub" id="asof"></p>
+  </header>
+
+  <section class="tiles" aria-label="今日摘要" id="tiles"></section>
+
+  <section class="panel" aria-labelledby="gaps-h" id="gaps-panel" hidden>
+    <div class="panel-head">
+      <h2 id="gaps-h">⚠️ 可能漏記</h2>
+      <span class="sub">餵奶間隔特別長的地方，點「補登」把漏掉的加回去</span>
+    </div>
+    <div class="gaps" id="gaps"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="rhythm-h">
+    <div class="panel-head">
+      <h2 id="rhythm-h">24 小時作息圖</h2>
+      <span class="sub">點色塊看細節 · 點空白處補登</span>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw" style="background:var(--sleep)"></i>睡眠</span>
+      <span><svg width="10" height="10" style="width:10px"><circle cx="5" cy="5" r="4" fill="var(--feed)"/></svg>餵奶</span>
+      <span><svg width="10" height="10" style="width:10px"><rect x="3" y="0" width="4" height="10" rx="1" fill="var(--pee)"/></svg>尿</span>
+      <span><svg width="10" height="10" style="width:10px"><rect x="0" y="3" width="10" height="4" rx="1" fill="var(--poo)"/></svg>便</span>
+      <span><i class="sw" style="background:var(--night)"></i>夜間 22–06</span>
+    </div>
+    <div id="rhythm"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="trend-h">
+    <div class="panel-head">
+      <h2 id="trend-h">每日趨勢</h2>
+      <div class="chips" role="group" aria-label="天數">
+        <button class="chip" id="r7" data-days="7" aria-pressed="false">7 天</button>
+        <button class="chip" id="r14" data-days="14" aria-pressed="true">14 天</button>
+        <button class="chip" id="r30" data-days="30" aria-pressed="false">30 天</button>
+      </div>
+    </div>
+    <div class="mini"><div class="mini-title"><span><i class="sw" style="background:var(--feed)"></i> 每日奶量 (ml)</span><b id="t-ml"></b></div><div id="c-ml"></div></div>
+    <div class="mini"><div class="mini-title"><span><i class="sw" style="background:var(--sleep)"></i> 每日睡眠 (小時)</span><b id="t-sleep"></b></div><div id="c-sleep"></div></div>
+    <div class="mini"><div class="mini-title"><span><i class="sw" style="background:var(--feed)"></i> 平均餵奶間隔 (小時)</span><b id="t-gap"></b></div><div id="c-gap"></div></div>
+    <div class="mini"><div class="mini-title"><span>尿布次數 · <i class="sw" style="background:var(--pee)"></i> 尿 <i class="sw" style="background:var(--poo)"></i> 便</span><b id="t-diaper"></b></div><div id="c-diaper"></div></div>
+    <details>
+      <summary>查看每日數字表格</summary>
+      <div class="tbl"><table id="tbl"></table></div>
+    </details>
+  </section>
+
+  <section class="panel" aria-labelledby="growth-h">
+    <div class="panel-head">
+      <h2 id="growth-h">成長曲線</h2>
+      <div class="chips" role="group" aria-label="項目">
+        <button class="chip" id="g-w" data-what="體重" aria-pressed="true">體重</button>
+        <button class="chip" id="g-h" data-what="身高" aria-pressed="false">身高</button>
+        <button class="chip" id="g-c" data-what="頭圍" aria-pressed="false">頭圍</button>
+      </div>
+    </div>
+    <div class="legend" id="growth-legend" aria-hidden="true"></div>
+    <div id="growth"></div>
+    <p class="note" id="growth-note"></p>
+  </section>
+
+  <p class="note">資料來自你們的試算表，每次打開都是最新的。這個連結可以看和新增紀錄，請不要轉傳給其他人。</p>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<div class="addbar"><button class="btn primary" id="add-btn" type="button">＋ 補登紀錄</button></div>
+<div class="toast" id="toast" role="status" hidden></div>
+
+<div class="overlay" id="overlay" hidden>
+  <form class="sheet" id="add-form" role="dialog" aria-modal="true" aria-labelledby="add-h" novalidate>
+    <div class="sheet-head"><h2 id="add-h">補登紀錄</h2><button class="x" type="button" id="add-close" aria-label="關閉">×</button></div>
+    <div class="seg" role="group" aria-label="類型" id="kind-seg">
+      <button type="button" id="k-feed" data-kind="feed" aria-pressed="true"><span>🍼</span>餵奶</button>
+      <button type="button" id="k-sleep" data-kind="sleep" aria-pressed="false"><span>😴</span>睡眠</button>
+      <button type="button" id="k-diaper" data-kind="diaper" aria-pressed="false"><span>🧷</span>尿布</button>
+      <button type="button" id="k-temp" data-kind="temp" aria-pressed="false"><span>🌡️</span>體溫</button>
+      <button type="button" id="k-weight" data-kind="weight" aria-pressed="false"><span>⚖️</span>體重</button>
+    </div>
+    <div class="fields">
+      <label class="field"><span>日期</span><select id="f-date"></select></label>
+      <label class="field"><span id="f-time-lab">時間</span><input type="time" id="f-time" step="300"></label>
+      <label class="field" data-for="sleep"><span>醒來時間</span><input type="time" id="f-end" step="300"></label>
+      <label class="field" data-for="feed"><span>種類</span><select id="f-feedtype"><option value="配方奶">配方奶</option><option value="瓶餵母乳">瓶餵母乳</option><option value="母乳">親餵</option><option value="副食品">副食品</option></select></label>
+      <label class="field" data-for="feed"><span id="f-ml-lab">奶量 (ml)</span><input type="number" id="f-ml" inputmode="numeric" min="1" max="400" step="10"></label>
+      <div class="field full" data-for="diaper"><span>內容</span><div class="seg three" id="diaper-seg">
+        <button type="button" id="d-pee" data-v="pee" aria-pressed="true">💧 尿</button>
+        <button type="button" id="d-poo" data-v="poo" aria-pressed="false">💩 便</button>
+        <button type="button" id="d-both" data-v="both" aria-pressed="false">尿＋便</button>
+      </div></div>
+      <label class="field" data-for="temp"><span>體溫 (°C)</span><input type="number" id="f-temp" inputmode="decimal" min="34" max="42" step="0.1" value="37.0"></label>
+      <label class="field" data-for="weight"><span>體重 (kg)</span><input type="number" id="f-kg" inputmode="decimal" min="1" max="20" step="0.01"></label>
+    </div>
+    <div class="preview-line" id="f-preview"></div>
+    <div class="err" id="f-err" role="alert"></div>
+    <button class="btn primary" type="submit" id="f-submit">補登</button>
+    <p class="note">會直接寫進試算表，跟在 LINE 打「10/6 14:30 配方奶 120」的效果一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
+  </form>
+</div>
+
+<script>
+var KEY = __KEY__;
+var DATA = __DATA__;
+(function () {
+  var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, OFF = 8 * HOUR;
+  var WD = '日一二三四五六';
+  var NS = 'http://www.w3.org/2000/svg';
+  // WHO 體重（kg）第 3／50／97 百分位，0～12 個月
+  var WHO = {
+    男: [[0, 2.5, 3.3, 4.4], [1, 3.4, 4.5, 5.8], [2, 4.4, 5.6, 7.1], [3, 5.1, 6.4, 8.0], [4, 5.6, 7.0, 8.7], [5, 6.1, 7.5, 9.3], [6, 6.4, 7.9, 9.8],
+      [7, 6.7, 8.3, 10.3], [8, 7.0, 8.6, 10.7], [9, 7.2, 8.9, 11.0], [10, 7.5, 9.2, 11.4], [11, 7.7, 9.4, 11.7], [12, 7.8, 9.6, 12.0]],
+    女: [[0, 2.4, 3.2, 4.2], [1, 3.2, 4.2, 5.4], [2, 4.0, 5.1, 6.5], [3, 4.6, 5.8, 7.4], [4, 5.1, 6.4, 8.1], [5, 5.5, 6.9, 8.7], [6, 5.8, 7.3, 9.2],
+      [7, 6.1, 7.6, 9.6], [8, 6.3, 7.9, 10.0], [9, 6.6, 8.2, 10.4], [10, 6.8, 8.5, 10.7], [11, 7.0, 8.7, 11.0], [12, 7.1, 8.9, 11.3]]
+  };
+
+  // ---------- 台灣時間工具 ----------
+  function tw(t) { var d = new Date(t + OFF); return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), wd: d.getUTCDay() }; }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hm(t) { var p = tw(t); return pad(p.h) + ':' + pad(p.mi); }
+  function md(t) { var p = tw(t); return (p.mo + 1) + '/' + p.d; }
+  function dayOf(t) { return Math.floor((t + OFF) / DAY) * DAY - OFF; }
+  function isNight(t) { var h = tw(t).h; return h >= 22 || h < 6; }
+  function dayLabel(d0) {
+    var off = Math.round((DATA.today - d0) / DAY);
+    return off === 0 ? '今天' : off === 1 ? '昨天' : md(d0) + ' ' + WD[tw(d0).wd];
+  }
+  function dur(ms) {
+    var m = Math.round(ms / MIN), h = Math.floor(m / 60);
+    if (h && m % 60) return h + '小時' + (m % 60) + '分';
+    if (h) return h + '小時';
+    return m + '分鐘';
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function $(id) { return document.getElementById(id); }
+  function el(name, attrs, parent) { var n = document.createElementNS(NS, name); for (var k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; }
+  function text(parent, x, y, s, attrs) { var a = { x: x, y: y }; for (var k in attrs || {}) a[k] = attrs[k]; var n = el('text', a, parent); n.textContent = s; return n; }
+  function niceMax(v, step) { return Math.max(step, Math.ceil(v / step) * step); }
+  function round5(t) { return Math.floor(t / (5 * MIN)) * 5 * MIN; }
+
+  // ---------- 提示框 ----------
+  var tip = $('tip');
+  function showTip(e, s) {
+    tip.textContent = s; tip.hidden = false;
+    var r = tip.getBoundingClientRect(), x = e.clientX + 12, y = e.clientY + 12;
+    if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 12;
+    if (x < 8) x = 8;
+    if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 12;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  }
+  function tipTarget(e) { return e.target.closest ? e.target.closest('[data-tip]') : null; }
+  document.addEventListener('pointermove', function (e) { var m = tipTarget(e); if (m) showTip(e, m.getAttribute('data-tip')); else if (e.pointerType === 'mouse') tip.hidden = true; });
+  document.addEventListener('pointerdown', function (e) { var m = tipTarget(e); if (m) showTip(e, m.getAttribute('data-tip')); else tip.hidden = true; });
+  addEventListener('scroll', function () { tip.hidden = true; }, { passive: true });
+
+  // ---------- 標題與摘要 ----------
+  function drawHeader() {
+    var b = DATA.baby || {}, parts = ['👶 ' + (b.name || '寶寶')];
+    if (b.birth) {
+      var days = Math.floor((DATA.today - dayOf(b.birth)) / DAY) + 1;
+      parts.push('出生第 ' + days + ' 天（' + Math.floor((days - 1) / 30.44) + ' 個月）');
+    }
+    $('baby-line').textContent = parts.join(' · ');
+    var p = tw(DATA.now);
+    $('asof').textContent = '更新於 ' + (p.mo + 1) + '/' + p.d + '（' + WD[p.wd] + '）' + hm(DATA.now) + ' · 今日統計到目前為止';
+  }
+
+  function drawTiles() {
+    var days = DATA.days, today = days[days.length - 1], yday = days[days.length - 2];
+    var html = '';
+    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--feed)"></i>今日奶量</span>' +
+      '<span class="v">' + today.ml + '<small>ml</small></span><span class="d">' + today.n + ' 餐' + (today.breast ? ' · 親餵 ' + today.breast + ' 分' : '') + ' · 昨天 ' + yday.ml + 'ml</span></div>';
+    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--sleep)"></i>今日睡眠</span>' +
+      '<span class="v">' + today.sleepH.toFixed(1) + '<small>小時</small></span><span class="d">' + (DATA.sleeping ? '現在正在睡 😴' : '現在醒著') + ' · 昨天 ' + yday.sleepH.toFixed(1) + 'h</span></div>';
+    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--pee)"></i>尿布</span>' +
+      '<span class="v">' + today.pee + '<small>尿</small> ' + today.poo + '<small>便</small></span><span class="d">' +
+      (DATA.lastDiaper ? '上次 ' + dayLabel(dayOf(DATA.lastDiaper.t)) + ' ' + hm(DATA.lastDiaper.t) : '還沒有紀錄') + '</span></div>';
+    var t = DATA.lastTemp;
+    html += '<div class="tile"><span class="k">🌡️ 體溫</span>' + (t
+      ? '<span class="v">' + t.v.toFixed(1) + '<small>°C</small></span><span class="d">' + dayLabel(dayOf(t.t)) + ' ' + hm(t.t) + ' · ' + (t.v >= 38 ? '發燒' : t.v >= 37.5 ? '偏高' : '正常') + '</span>'
+      : '<span class="v">–</span><span class="d">還沒有紀錄</span>') + '</div>';
+    var f = DATA.lastFeed, pr = DATA.prediction;
+    html += '<div class="tile wide"><div><span class="k">🔮 預計下一餐</span><span class="v">' + (pr ? '約 ' + hm(pr.at) : '–') + '</span></div>' +
+      '<span class="d">' + (f ? '上一餐 ' + dayLabel(dayOf(f.t)) + ' ' + hm(f.t) + ' ' + esc(f.label) : '還沒有餵奶紀錄') +
+      (pr && pr.amount ? '<br>建議準備約 ' + pr.amount + 'ml' : pr ? '' : '<br>多記幾餐（約 1～2 天）就會開始預測') + '</span></div>';
+    $('tiles').innerHTML = html;
+  }
+
+  // ---------- 可能漏記 ----------
+  function limitFor(t) { return (isNight(t) ? 6.5 : 4.5) * HOUR; }
+  function findGaps() {
+    var out = [], from = DATA.today - 6 * DAY, f = DATA.feeds;
+    for (var i = 1; i < f.length; i++) {
+      if (f[i].t < from) continue;
+      if (f[i].t - f[i - 1].t > limitFor(f[i - 1].t)) out.push({ a: f[i - 1].t, b: f[i].t });
+    }
+    if (f.length) {
+      var last = f[f.length - 1].t;
+      if (DATA.now - last > limitFor(last)) out.push({ a: last, b: DATA.now, open: true });
+    }
+    return out;
+  }
+  function gapMid(g) { return round5(g.a + (g.b - g.a) / 2); }
+  function drawGaps() {
+    var gs = findGaps(), host = $('gaps');
+    $('gaps-panel').hidden = !gs.length;
+    host.innerHTML = '';
+    gs.forEach(function (g) {
+      var row = document.createElement('div'); row.className = 'gap-row';
+      row.innerHTML = '<span><b>' + dayLabel(dayOf(g.a)) + ' ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + '</b> · ' + dur(g.b - g.a) + '沒有餵奶紀錄</span>';
+      var b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = '補登';
+      b.addEventListener('click', function () { openForm({ at: gapMid(g), kind: 'feed' }); });
+      row.appendChild(b); host.appendChild(row);
+    });
+  }
+
+  // ---------- 24 小時作息圖 ----------
+  function drawRhythm() {
+    var host = $('rhythm'); host.innerHTML = '';
+    var W = host.clientWidth || 340, L = 46, R = 6, T = 4, rowH = 30, rows = 7;
+    var H = T + rows * rowH + 18, PW = W - L - R;
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img', 'aria-label': '最近 7 天的 24 小時作息圖' }, host);
+    function x(h) { return L + (h / 24) * PW; }
+    var gaps = findGaps();
+    for (var r = 0; r < rows; r++) (function (r) {
+      var d0 = DATA.today - r * DAY, y = T + r * rowH, cy = y + rowH / 2;
+      function toH(t) { return (t - d0) / HOUR; }
+      el('rect', { x: x(0), y: y + 2, width: x(6) - x(0), height: rowH - 4, fill: 'var(--night)', rx: 3 }, svg);
+      el('rect', { x: x(22), y: y + 2, width: x(24) - x(22), height: rowH - 4, fill: 'var(--night)', rx: 3 }, svg);
+      el('line', { x1: L, x2: L + PW, y1: cy, y2: cy, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      text(svg, L - 6, cy + 4, dayLabel(d0), { 'text-anchor': 'end', 'class': 'rowlab' });
+      var bg = el('rect', { x: L, y: y, width: PW, height: rowH, fill: 'transparent', style: 'cursor:copy' }, svg);
+      bg.addEventListener('click', function (ev) {
+        var box = svg.getBoundingClientRect(), h = ((ev.clientX - box.left) * (W / box.width) - L) / PW * 24;
+        var at = d0 + Math.round(Math.max(0, Math.min(23.9, h)) * 12) * 5 * MIN;
+        openForm({ at: Math.min(at, round5(DATA.now)) });
+      });
+      gaps.forEach(function (g) {
+        var a = Math.max(g.a, d0), b = Math.min(g.b, d0 + DAY);
+        if (b <= a) return;
+        var gr = el('rect', { x: x(toH(a)) + 6, y: y + 3, width: Math.max(4, x(toH(b)) - x(toH(a)) - 12), height: rowH - 6, rx: 4,
+          fill: 'var(--warn-bg)', stroke: 'var(--warn)', 'stroke-dasharray': '3 2', style: 'cursor:copy',
+          'data-tip': '⚠️ ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + ' 沒有餵奶紀錄（' + dur(g.b - g.a) + '）\n點一下補登' }, svg);
+        gr.addEventListener('click', function () { openForm({ at: gapMid(g), kind: 'feed' }); });
+      });
+      DATA.sleeps.forEach(function (s) {
+        var a = Math.max(s.s, d0), b = Math.min(s.e, d0 + DAY);
+        if (b <= a) return;
+        el('rect', { x: x(toH(a)), y: cy - 6, width: Math.max(1.5, x(toH(b)) - x(toH(a)) - 1), height: 12, rx: 3, fill: 'var(--sleep)',
+          stroke: s.web ? 'var(--ink)' : 'none', 'stroke-width': 1.5 }, svg);
+        el('rect', { x: x(toH(a)), y: y, width: Math.max(6, x(toH(b)) - x(toH(a))), height: rowH, fill: 'transparent',
+          'data-tip': '😴 睡眠 ' + hm(s.s) + '–' + (s.ongoing ? '現在' : hm(s.e)) + '\n共 ' + dur(s.e - s.s) + (s.ongoing ? '（還在睡）' : '') + (s.web ? '（網頁補登）' : '') }, svg);
+      });
+      DATA.diapers.forEach(function (dz) {
+        if (dz.t < d0 || dz.t >= d0 + DAY) return;
+        var px = x(toH(dz.t));
+        if (dz.kind === 'pee') el('rect', { x: px - 1.5, y: y + 1, width: 3, height: 7, rx: 1, fill: 'var(--pee)' }, svg);
+        else el('rect', { x: px - 4, y: y + rowH - 6, width: 8, height: 4, rx: 1, fill: 'var(--poo)' }, svg);
+        el('circle', { cx: px, cy: dz.kind === 'pee' ? y + 4 : y + rowH - 4, r: 8, fill: 'transparent', 'data-tip': (dz.kind === 'pee' ? '💧 尿布 尿 ' : '💩 尿布 便 ') + hm(dz.t) }, svg);
+      });
+      DATA.feeds.forEach(function (f, i) {
+        if (f.t < d0 || f.t >= d0 + DAY) return;
+        var px = x(toH(f.t)), prev = DATA.feeds[i - 1];
+        el('circle', { cx: px, cy: cy, r: f.web ? 5.5 : 4.5, fill: 'var(--feed)', stroke: f.web ? 'var(--ink)' : 'var(--surface)', 'stroke-width': 2 }, svg);
+        el('circle', { cx: px, cy: cy, r: 11, fill: 'transparent',
+          'data-tip': '🍼 ' + hm(f.t) + ' ' + f.label + (f.web ? '（網頁補登）' : '') + (prev ? '\n距離上一餐 ' + dur(f.t - prev.t) : '') }, svg);
+      });
+    })(r);
+    [0, 6, 12, 18, 24].forEach(function (h) {
+      el('line', { x1: x(h), x2: x(h), y1: T, y2: T + rows * rowH, stroke: 'var(--grid)', 'stroke-width': 1, 'stroke-dasharray': h % 24 ? '2 3' : '' }, svg);
+      text(svg, x(h), H - 4, h === 24 ? '24' : pad(h) + ':00', { 'text-anchor': h === 0 ? 'start' : h === 24 ? 'end' : 'middle' });
+    });
+    var nx = x((DATA.now - DATA.today) / HOUR);
+    el('line', { x1: nx, x2: nx, y1: T, y2: T + rowH, stroke: 'var(--ink)', 'stroke-width': 1.5 }, svg);
+    text(svg, nx + 3 > L + PW - 24 ? nx - 3 : nx + 3, T + 9, '現在', { 'class': 'vlab', 'text-anchor': nx + 3 > L + PW - 24 ? 'end' : 'start' });
+  }
+
+  // ---------- 每日趨勢 ----------
+  var range = 14;
+  function frame(id, H) {
+    var host = $(id); host.innerHTML = '';
+    var W = host.clientWidth || 340;
+    return { W: W, H: H, L: 34, T: 10, PH: H - 28, PW: W - 34 - 6, svg: el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img' }, host) };
+  }
+  function gridY(f, ticks, y, fmt) {
+    ticks.forEach(function (v, i) {
+      el('line', { x1: f.L, x2: f.L + f.PW, y1: y(v), y2: y(v), stroke: i ? 'var(--grid)' : 'var(--axis)', 'stroke-width': 1 }, f.svg);
+      text(f.svg, f.L - 5, y(v) + 3, fmt(v), { 'text-anchor': 'end' });
+    });
+  }
+  function labelsX(f, list, bw) {
+    var every = list.length > 14 ? 7 : list.length > 7 ? 2 : 1;
+    list.forEach(function (d, i) {
+      if ((list.length - 1 - i) % every === 0) text(f.svg, f.L + bw * i + bw / 2, f.H - 4, d.d0 === DATA.today ? '今天' : md(d.d0), { 'text-anchor': 'middle' });
+    });
+  }
+  function hit(f, list, bw, tipFor) {
+    list.forEach(function (d, i) {
+      el('rect', { x: f.L + bw * i, y: f.T, width: bw, height: f.PH, fill: 'transparent', 'data-tip': dayLabel(d.d0) + (d.d0 === DATA.today ? '（到目前）' : '') + '\n' + tipFor(d) }, f.svg);
+    });
+  }
+  function bars(id, list, key, color, step, tipFor) {
+    var f = frame(id, 110), max = niceMax(Math.max.apply(null, list.map(function (d) { return d[key]; })), step);
+    function y(v) { return f.T + f.PH - (v / max) * f.PH; }
+    gridY(f, [0, max / 2, max], y, function (v) { return v; });
+    var bw = f.PW / list.length, w = Math.max(2, Math.min(18, bw - 2));
+    list.forEach(function (d, i) {
+      var cx = f.L + bw * i + bw / 2, h = Math.max(0, y(0) - y(d[key]));
+      if (!h) return;
+      var top = Math.min(3, h);
+      el('path', { d: 'M' + (cx - w / 2) + ',' + y(0) + ' v' + -(h - top) + ' q0,-' + top + ' ' + top + ',-' + top + ' h' + (w - 2 * top) + ' q' + top + ',0 ' + top + ',' + top + ' v' + (h - top) + ' z',
+        fill: color, opacity: d.d0 === DATA.today ? 0.45 : 1 }, f.svg);
+    });
+    hit(f, list, bw, tipFor); labelsX(f, list, bw);
+  }
+  function stacked(id, list) {
+    var f = frame(id, 100), max = niceMax(Math.max.apply(null, list.map(function (d) { return d.pee + d.poo; })), 4);
+    function y(v) { return f.T + f.PH - (v / max) * f.PH; }
+    gridY(f, [0, max / 2, max], y, function (v) { return v; });
+    var bw = f.PW / list.length, w = Math.max(2, Math.min(18, bw - 2));
+    list.forEach(function (d, i) {
+      var cx = f.L + bw * i + bw / 2, op = d.d0 === DATA.today ? 0.45 : 1;
+      if (d.pee) el('rect', { x: cx - w / 2, y: y(d.pee), width: w, height: y(0) - y(d.pee), fill: 'var(--pee)', opacity: op }, f.svg);
+      if (d.poo) el('rect', { x: cx - w / 2, y: y(d.pee + d.poo), width: w, height: Math.max(1, y(d.pee) - y(d.pee + d.poo) - (d.pee ? 2 : 0)), rx: 2, fill: 'var(--poo)', opacity: op }, f.svg);
+    });
+    hit(f, list, bw, function (d) { return '尿 ' + d.pee + ' 次 · 便 ' + d.poo + ' 次'; }); labelsX(f, list, bw);
+  }
+  function gapLine(id, list) {
+    var f = frame(id, 100), bw = f.PW / list.length;
+    var vals = list.filter(function (d) { return d.gapH != null; }).map(function (d) { return d.gapH; });
+    if (!vals.length) { f.svg.remove(); $(id).innerHTML = '<div class="empty">一天有兩餐以上的紀錄，才算得出間隔。</div>'; return; }
+    var lo = Math.max(0, Math.floor(Math.min.apply(null, vals) * 2) / 2 - 0.5), hi = Math.ceil(Math.max.apply(null, vals) * 2) / 2 + 0.5;
+    function y(v) { return f.T + f.PH - ((v - lo) / (hi - lo)) * f.PH; }
+    gridY(f, [lo, (lo + hi) / 2, hi], y, function (v) { return v.toFixed(1); });
+    var pts = [];
+    list.forEach(function (d, i) { if (d.gapH != null) pts.push([f.L + bw * i + bw / 2, y(d.gapH), d]); });
+    el('path', { d: 'M' + pts.map(function (p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' L'), fill: 'none', stroke: 'var(--feed)', 'stroke-width': 2, 'stroke-linejoin': 'round' }, f.svg);
+    var last = pts[pts.length - 1];
+    el('circle', { cx: last[0], cy: last[1], r: 4, fill: 'var(--feed)', stroke: 'var(--surface)', 'stroke-width': 2 }, f.svg);
+    hit(f, list, bw, function (d) { return d.gapH == null ? '紀錄不足' : '平均間隔 ' + dur(d.gapH * HOUR) + '（' + d.n + ' 餐）'; }); labelsX(f, list, bw);
+  }
+  function avg(list, k) { return list.length ? list.reduce(function (a, d) { return a + d[k]; }, 0) / list.length : 0; }
+  function drawTrends() {
+    var list = DATA.days.slice(-range);
+    var full = list.filter(function (d) { return d.d0 !== DATA.today && (d.n || d.sleepH || d.pee || d.poo); });
+    bars('c-ml', list, 'ml', 'var(--feed)', 200, function (d) { return '奶量 ' + d.ml + 'ml（' + d.n + ' 餐）'; });
+    bars('c-sleep', list, 'sleepH', 'var(--sleep)', 4, function (d) { return '睡眠 ' + dur(d.sleepH * HOUR); });
+    gapLine('c-gap', list);
+    stacked('c-diaper', list);
+    if (full.length) {
+      var half = Math.floor(full.length / 2), delta = Math.round(avg(full.slice(half), 'ml') - avg(full.slice(0, half), 'ml'));
+      $('t-ml').innerHTML = '平均 ' + Math.round(avg(full, 'ml')) + 'ml/天' + (half ? ' <span style="color:' + (delta >= 0 ? 'var(--good)' : 'var(--ink-2)') + ';font-weight:500">' + (delta >= 0 ? '▲' : '▼') + ' ' + Math.abs(delta) + '</span>' : '');
+      $('t-sleep').textContent = '平均 ' + avg(full, 'sleepH').toFixed(1) + ' 小時/天';
+      var gl = full.filter(function (d) { return d.gapH != null; });
+      $('t-gap').textContent = gl.length ? '最近 ' + dur(gl[gl.length - 1].gapH * HOUR) : '';
+      $('t-diaper').textContent = '平均尿 ' + avg(full, 'pee').toFixed(1) + ' · 便 ' + avg(full, 'poo').toFixed(1);
+    } else {
+      ['t-ml', 't-sleep', 't-gap', 't-diaper'].forEach(function (id) { $(id).textContent = ''; });
+    }
+    $('tbl').innerHTML = '<thead><tr><th>日期</th><th>奶量</th><th>餐數</th><th>睡眠</th><th>間隔</th><th>尿</th><th>便</th></tr></thead><tbody>' +
+      list.slice().reverse().map(function (d) {
+        return '<tr><td>' + dayLabel(d.d0) + '</td><td>' + d.ml + 'ml</td><td>' + d.n + '</td><td>' + d.sleepH.toFixed(1) + 'h</td><td>' +
+          (d.gapH != null ? d.gapH.toFixed(1) + 'h' : '–') + '</td><td>' + d.pee + '</td><td>' + d.poo + '</td></tr>';
+      }).join('') + '</tbody>';
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-days]'), function (c) {
+    c.addEventListener('click', function () {
+      range = Number(c.getAttribute('data-days'));
+      Array.prototype.forEach.call(document.querySelectorAll('[data-days]'), function (o) { o.setAttribute('aria-pressed', String(o === c)); });
+      drawTrends();
+    });
+  });
+
+  // ---------- 成長曲線 ----------
+  var growthWhat = '體重';
+  function drawGrowth() {
+    var host = $('growth'); host.innerHTML = '';
+    var b = DATA.baby || {}, pts = DATA.growth.filter(function (g) { return g.what === growthWhat; });
+    var unit = growthWhat === '體重' ? 'kg' : 'cm';
+    var who = growthWhat === '體重' && b.birth && WHO[b.sex] ? WHO[b.sex] : null;
+    var legend = '<span><i class="sw" style="background:var(--sleep)"></i>' + esc(b.name || '寶寶') + '</span>';
+    if (who) legend += '<span><i class="sw" style="background:var(--band);border:1px solid var(--axis)"></i>WHO 第 3–97 百分位</span>' +
+      '<span><svg width="16" height="10" style="width:16px"><line x1="0" y1="5" x2="16" y2="5" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="3 2"/></svg>中位數</span>';
+    $('growth-legend').innerHTML = legend;
+    if (!pts.length) {
+      host.innerHTML = '<div class="empty">還沒有' + growthWhat + '紀錄。在 LINE 輸入「' + growthWhat + ' ' + (growthWhat === '體重' ? '6.2' : growthWhat === '身高' ? '62' : '40') + '」就會出現在這裡。</div>';
+      $('growth-note').textContent = growthWhat === '體重' && !who ? '在 LINE 輸入「設定 生日 2026/8/5」和「設定 性別 男」（或 女），就會對照 WHO 標準。' : '';
+      return;
+    }
+    var W = host.clientWidth || 340, L = 34, R = 10, T = 10, H = 200, B = 20, PH = H - T - B, PW = W - L - R;
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img', 'aria-label': growthWhat + '成長曲線' }, host);
+    var X0, X1, xOf, xLabel;
+    var MONTH = 30.4375 * DAY;
+    if (b.birth) {
+      var ageMax = (Math.max(DATA.now, pts[pts.length - 1].t) - b.birth) / MONTH;
+      X0 = 0; X1 = Math.min(who ? 12 : 24, Math.max(3, Math.ceil(ageMax + 0.5)));
+      xOf = function (t) { return (t - b.birth) / MONTH; };
+      xLabel = function (m) { return m === 0 ? '出生' : m + '月'; };
+    } else {
+      X0 = dayOf(pts[0].t); X1 = Math.max(X0 + 7 * DAY, dayOf(pts[pts.length - 1].t) + DAY);
+      xOf = function (t) { return t; };
+      xLabel = function (t) { return md(t); };
+    }
+    var vals = pts.map(function (p) { return p.v; });
+    if (who) who.forEach(function (r) { if (r[0] <= X1) { vals.push(r[1], r[3]); } });
+    var step = growthWhat === '體重' ? 1 : 2;
+    var lo = Math.floor(Math.min.apply(null, vals) / step) * step - step, hi = Math.ceil(Math.max.apply(null, vals) / step) * step + step;
+    lo = Math.max(0, lo);
+    function x(v) { return L + ((v - X0) / (X1 - X0)) * PW; }
+    function y(v) { return T + PH - ((v - lo) / (hi - lo)) * PH; }
+    var yStep = Math.max(step, Math.ceil((hi - lo) / 5 / step) * step);
+    for (var v = lo; v <= hi + 1e-9; v += yStep) {
+      el('line', { x1: L, x2: L + PW, y1: y(v), y2: y(v), stroke: v === lo ? 'var(--axis)' : 'var(--grid)' }, svg);
+      text(svg, L - 5, y(v) + 3, v, { 'text-anchor': 'end' });
+    }
+    if (b.birth) {
+      var every = X1 > 12 ? 3 : X1 > 6 ? 2 : 1;
+      for (var m = 0; m <= X1; m += every) text(svg, x(m), H - 5, xLabel(m), { 'text-anchor': m === 0 ? 'start' : m >= X1 ? 'end' : 'middle' });
+    } else {
+      var n = 4;
+      for (var i = 0; i <= n; i++) { var t = X0 + (X1 - X0) * i / n; text(svg, x(t), H - 5, xLabel(t), { 'text-anchor': i === 0 ? 'start' : i === n ? 'end' : 'middle' }); }
+    }
+    if (who) {
+      var rows = who.filter(function (r) { return r[0] <= X1; });
+      el('path', { d: 'M' + rows.map(function (r) { return x(r[0]) + ',' + y(r[3]); }).join(' L') + ' L' + rows.slice().reverse().map(function (r) { return x(r[0]) + ',' + y(r[1]); }).join(' L') + 'Z', fill: 'var(--band)' }, svg);
+      el('path', { d: 'M' + rows.map(function (r) { return x(r[0]) + ',' + y(r[2]); }).join(' L'), fill: 'none', stroke: 'var(--muted)', 'stroke-width': 1.5, 'stroke-dasharray': '4 3' }, svg);
+      var lr = rows[rows.length - 1];
+      text(svg, x(lr[0]) - 2, y(lr[3]) - 4, 'P97', { 'text-anchor': 'end' });
+      text(svg, x(lr[0]) - 2, y(lr[2]) - 4, 'P50', { 'text-anchor': 'end' });
+      text(svg, x(lr[0]) - 2, y(lr[1]) + 12, 'P3', { 'text-anchor': 'end' });
+    }
+    if (pts.length > 1) el('path', { d: 'M' + pts.map(function (p) { return x(xOf(p.t)) + ',' + y(p.v); }).join(' L'), fill: 'none', stroke: 'var(--sleep)', 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
+    pts.forEach(function (p, i) {
+      var last = i === pts.length - 1;
+      el('circle', { cx: x(xOf(p.t)), cy: y(p.v), r: last ? 5 : 4, fill: 'var(--sleep)', stroke: 'var(--surface)', 'stroke-width': 2 }, svg);
+      el('circle', { cx: x(xOf(p.t)), cy: y(p.v), r: 12, fill: 'transparent', 'data-tip': md(p.t) + ' ' + growthWhat + ' ' + p.v + p.unit }, svg);
+    });
+    var lp = pts[pts.length - 1], lx = x(xOf(lp.t));
+    text(svg, lx > L + PW - 50 ? lx - 8 : lx + 8, y(lp.v) - 8, lp.v + unit, { 'class': 'vlab', 'text-anchor': lx > L + PW - 50 ? 'end' : 'start' });
+
+    var note = '最近一次 ' + md(lp.t) + ' ' + lp.v + unit + '。';
+    if (who) {
+      var age = xOf(lp.t), k = Math.min(11, Math.floor(age)), fr = age - k;
+      if (age <= 12) {
+        var a = who[k], c = who[k + 1];
+        var p3 = a[1] + (c[1] - a[1]) * fr, p50 = a[2] + (c[2] - a[2]) * fr, p97 = a[3] + (c[3] - a[3]) * fr;
+        note += lp.v < p3 ? '低於 WHO 第 3 百分位，建議請醫師評估。' : lp.v > p97 ? '高於 WHO 第 97 百分位，建議請醫師評估。' :
+          '在 WHO 第 3–97 百分位之間（' + (lp.v >= p50 ? '中位數以上' : '中位數以下') + '）。';
+      }
+    } else if (growthWhat === '體重') {
+      note += '在 LINE 輸入「設定 生日 2026/8/5」和「設定 性別 男」（或 女），就會對照 WHO 標準。';
+    }
+    $('growth-note').textContent = note;
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-what]'), function (c) {
+    c.addEventListener('click', function () {
+      growthWhat = c.getAttribute('data-what');
+      Array.prototype.forEach.call(document.querySelectorAll('[data-what]'), function (o) { o.setAttribute('aria-pressed', String(o === c)); });
+      drawGrowth();
+    });
+  });
+
+  // ---------- 補登表單 ----------
+  var overlay = $('overlay'), form = $('add-form'), kind = 'feed', diaperV = 'pee', lastFocus = null, saving = false;
+  function fillDates() {
+    var sel = $('f-date'); sel.innerHTML = '';
+    for (var i = 0; i < 7; i++) {
+      var d0 = DATA.today - i * DAY, o = document.createElement('option');
+      o.value = String(d0); o.textContent = dayLabel(d0) + (i < 2 ? '（' + md(d0) + '）' : '');
+      sel.appendChild(o);
+    }
+  }
+  function lastMl() {
+    for (var i = DATA.feeds.length - 1; i >= 0; i--) { var m = DATA.feeds[i].label.match(/(\d+)ml/); if (m) return Number(m[1]); }
+    return 120;
+  }
+  function lastKg() { var w = DATA.growth.filter(function (g) { return g.what === '體重'; }); return w.length ? w[w.length - 1].v : ''; }
+  function setKind(k) {
+    kind = k;
+    Array.prototype.forEach.call(document.querySelectorAll('#kind-seg button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-kind') === k)); });
+    Array.prototype.forEach.call(form.querySelectorAll('[data-for]'), function (f) { f.hidden = f.getAttribute('data-for') !== k; });
+    $('f-time-lab').textContent = k === 'sleep' ? '入睡時間' : '時間';
+    update();
+  }
+  function setDiaper(v) {
+    diaperV = v;
+    Array.prototype.forEach.call(document.querySelectorAll('#diaper-seg button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-v') === v)); });
+    update();
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('#kind-seg button'), function (b) { b.addEventListener('click', function () { setKind(b.getAttribute('data-kind')); }); });
+  Array.prototype.forEach.call(document.querySelectorAll('#diaper-seg button'), function (b) { b.addEventListener('click', function () { setDiaper(b.getAttribute('data-v')); }); });
+  $('f-feedtype').addEventListener('change', function () {
+    var t = $('f-feedtype').value;
+    $('f-ml-lab').textContent = t === '母乳' ? '時間 (分鐘)' : t === '副食品' ? '份量 (g)' : '奶量 (ml)';
+    $('f-ml').value = t === '母乳' ? 15 : t === '副食品' ? 30 : lastMl();
+    update();
+  });
+  form.addEventListener('input', update);
+
+  function payload() {
+    return { kind: kind, day: Number($('f-date').value), time: $('f-time').value, end: $('f-end').value, feedType: $('f-feedtype').value,
+      amount: $('f-ml').value, diaper: diaperV, temp: $('f-temp').value, kg: $('f-kg').value };
+  }
+  function describeForm(p) {
+    if (!p.time) return '';
+    var when = md(p.day) + ' ' + p.time;
+    if (kind === 'feed') {
+      var unit = p.feedType === '母乳' ? '分鐘' : p.feedType === '副食品' ? 'g' : 'ml';
+      return p.amount ? when + ' ' + (p.feedType === '母乳' ? '親餵' : p.feedType) + ' ' + p.amount + unit : '';
+    }
+    if (kind === 'sleep') return p.end ? md(p.day) + ' ' + p.time + '–' + p.end + ' 睡眠' + (p.end <= p.time ? '（跨夜）' : '') : '';
+    if (kind === 'diaper') return when + ' 尿布 ' + { pee: '尿', poo: '便', both: '尿＋便' }[p.diaper];
+    if (kind === 'temp') return p.temp ? when + ' 體溫 ' + p.temp + '°C' : '';
+    return p.kg ? when + ' 體重 ' + p.kg + 'kg' : '';
+  }
+  function update() {
+    var line = describeForm(payload());
+    $('f-preview').textContent = line ? '將補登：' + line : '';
+    $('f-preview').hidden = !line;
+    $('f-err').textContent = '';
+  }
+  function openForm(o) {
+    o = o || {};
+    lastFocus = document.activeElement; tip.hidden = true;
+    var at = o.at || round5(DATA.now);
+    fillDates();
+    $('f-date').value = String(dayOf(at));
+    if (!$('f-date').value) $('f-date').selectedIndex = 0;
+    $('f-time').value = hm(at);
+    $('f-end').value = hm(Math.min(at + HOUR, round5(DATA.now)));
+    $('f-ml').value = lastMl();
+    $('f-kg').value = lastKg();
+    overlay.hidden = false;
+    setKind(o.kind || kind);
+    $('f-time').focus();
+  }
+  function closeForm() { overlay.hidden = true; if (lastFocus && lastFocus.focus) lastFocus.focus(); }
+  $('add-btn').addEventListener('click', function () { openForm(); });
+  $('add-close').addEventListener('click', closeForm);
+  overlay.addEventListener('click', function (e) { if (e.target === overlay) closeForm(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) closeForm(); });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (saving) return;
+    var p = payload();
+    if (!describeForm(p)) { $('f-err').textContent = '請把時間和數值填完整'; return; }
+    if (typeof google === 'undefined' || !google.script || !google.script.run) { $('f-err').textContent = '請從 LINE 裡的報表連結打開這個頁面，才能補登。'; return; }
+    saving = true; $('f-submit').disabled = true; $('f-submit').textContent = '儲存中…';
+    function done() { saving = false; $('f-submit').disabled = false; $('f-submit').textContent = '補登'; }
+    google.script.run
+      .withSuccessHandler(function (res) {
+        done();
+        if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || '補登失敗，請再試一次。'; return; }
+        DATA = res.data;
+        closeForm();
+        drawAll();
+        toast(res.message);
+      })
+      .withFailureHandler(function (err) { done(); $('f-err').textContent = '補登失敗：' + (err && err.message ? err.message : err); })
+      .webAddRecord(KEY, p);
+  });
+  var tt;
+  function toast(s) { var t = $('toast'); t.textContent = s; t.hidden = false; clearTimeout(tt); tt = setTimeout(function () { t.hidden = true; }, 3500); }
+
+  function drawAll() { drawHeader(); drawTiles(); drawGaps(); drawRhythm(); drawTrends(); drawGrowth(); }
+  drawAll();
+  var rt; addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(drawAll, 120); });
+})();
+</script>
+</body>
+</html>
+`;
