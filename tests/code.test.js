@@ -678,3 +678,21 @@ test('報表網頁的 JavaScript 可以解析', () => {
   assert.ok(script.includes("'\\n'") || script.includes('\\n'), '換行跳脫要保留');
   assert.ok(script.includes('/(\\d+)ml/'), '正規表示式的反斜線要保留');
 });
+
+test('checkSetup 找出沒填 token', () => {
+  const ss = new FakeSpreadsheet();
+  const logs = [];
+  const quiet = { log: (m) => logs.push(m), error: () => {} };
+  const base = { SpreadsheetApp: { getActiveSpreadsheet: () => ss }, ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) } };
+  const noToken = load({ ...base, console: quiet, PropertiesService: { getScriptProperties: () => new FakeProperties() } });
+  assert.match(noToken.checkSetup(), /❌ 沒有 token/);
+  const props = new FakeProperties();
+  props.setProperty('LINE_CHANNEL_ACCESS_TOKEN', 'T');
+  const ok = load({
+    ...base, console: quiet, PropertiesService: { getScriptProperties: () => props },
+    UrlFetchApp: { fetch: () => ({ getResponseCode: () => 200, getContentText: () => '{"displayName":"寶寶日記"}' }) },
+  });
+  const r = ok.checkSetup();
+  assert.match(r, /✅ token 正確，LINE 官方帳號：寶寶日記/);
+  assert.match(r, /✅ 部署網址：https:\/\/script\.google\.com/);
+});

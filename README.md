@@ -172,6 +172,15 @@ token 已經存在「指令碼屬性」裡，所以更新時最上面那行不�
 >
 > 如果「報表」回覆說拿不到網址，可以到 Apps Script 的 **專案設定 → 指令碼屬性**，新增 `WEB_APP_URL`，值填部署網址（`https://script.google.com/macros/s/.../exec`）。
 
+## LINE 沒回應時
+1. 打開 Apps Script，上方函式選單選 **checkSetup**，按 **▶ 執行**。
+2. 看下方「執行記錄」，照打 ❌ 的那一行處理：
+   - **沒有 token**：把 Channel access token 貼到程式最上面那行，按 💾 儲存。
+   - **token 不正確**：到 LINE Developers Console 重新複製 token。
+   - **部署網址**：要跟 LINE Developers Console 的 Webhook URL 一樣。
+3. 改完程式一定要 **部署 → 管理部署作業 → ✏️ 編輯 → 版本選新版本 → 部署**。
+4. 還是不行的話，左邊選單 **⏰ 執行作業** 點最上面那筆 `doPost`，可以看到錯誤訊息。
+
 ## 安全提醒
 - Channel access token 等於 bot 的鑰匙，不要分享給別人，也不要上傳到 GitHub。
 - Apps Script 沒辦法驗證訊息是不是真的從 LINE 傳來的，所以**不要把部署網址分享給別人**。網址是一長串亂碼，別人猜不到。

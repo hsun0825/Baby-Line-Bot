@@ -56,7 +56,9 @@ function lineToken() {
     }
     return LINE_CHANNEL_ACCESS_TOKEN;
   }
-  return (p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN')) || '';
+  const saved = p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!saved) console.error('找不到 LINE token：請把 token 貼到程式最上面那行，存檔後重新部署（新版本）。');
+  return saved || '';
 }
 
 function getBabyInfo(chatId) {
@@ -155,6 +157,32 @@ function setup() {
     muteHttpExceptions: true,
   });
   console.log('設定完成！token 已經存起來，以後更新程式不用再填。接下來請按「部署」。');
+}
+
+// LINE 沒回應時，在編輯器裡選 checkSetup 按「執行」，看「執行記錄」裡哪一項打 ❌
+function checkSetup() {
+  const lines = [];
+  const token = lineToken();
+  if (!token) {
+    lines.push('❌ 沒有 token：請把 Channel access token 貼到程式最上面那行，按儲存後再執行一次 checkSetup。');
+  } else {
+    const res = UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
+      headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 200) {
+      lines.push('✅ token 正確，LINE 官方帳號：' + JSON.parse(res.getContentText()).displayName);
+    } else {
+      lines.push('❌ token 不正確（LINE 回應 ' + res.getResponseCode() + '）：請到 LINE Developers Console 重新複製 Channel access token。');
+    }
+  }
+  const storage = new SheetStorage();
+  lines.push('✅ 試算表「' + SHEET_NAME + '」有 ' + Math.max(0, storage.sheet.getLastRow() - 1) + ' 筆紀錄');
+  const url = webAppUrl();
+  lines.push(url ? '✅ 部署網址：' + url + '\n   （要跟 LINE Developers Console 的 Webhook URL 一樣）'
+    : '❌ 還沒有部署成網頁應用程式：部署 → 新增部署作業 → 網頁應用程式');
+  lines.push('提醒：改完程式要「部署 → 管理部署作業 → ✏️ 編輯 → 版本選新版本 → 部署」，LINE 才會用到新程式。');
+  console.log(lines.join('\n'));
+  return lines.join('\n');
 }
 
 // 用瀏覽器打開部署網址會看到「運作中」；帶著報表密碼（?r=...）則是寶寶作息報表
