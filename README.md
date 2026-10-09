@@ -59,6 +59,26 @@
 - 輸入 `狀態` 也會顯示還有多久到下一餐。
 - 預測只是參考，請以寶寶的實際反應為主。
 
+### 🍼 用表單記錄（快速按鈕）
+回覆下方的快速按鈕精簡成 9 個。「🍼 餵奶」、「🧷 尿布」、「＋ 其他」點了會打開一個記錄表單：時間預設現在、奶量預設上一餐，改一改按「記錄」就好。也可以切換到睡眠、體溫、體重，或選前幾天補登。
+
+- **沒設定 LIFF**：表單用 LINE 內建瀏覽器全螢幕打開，記錄直接寫進試算表。
+- **設定 LIFF 後**：表單會從聊天室下方滑出（約 8 成畫面）。如果 LINE 允許，按「記錄」會以你的名義把指令（例如「配方奶 150」）傳到聊天室，bot 照常回覆並預測下一餐，視窗自動關閉；不允許的話一樣直接寫進試算表。
+
+#### 設定 LIFF（約 5 分鐘，做一次就好）
+1. [LINE Developers Console](https://developers.line.biz/console/) → 跟官方帳號同一個 Provider → **Create a new channel** → 選 **LINE Login**。
+   - Region、國家都選 **Taiwan**（建立後不能改）；App types 勾 **Web app**。
+2. 進到這個 channel 的 **LIFF** 分頁 → **Add**：
+   - **Size**：Tall
+   - **Endpoint URL**：Apps Script 的部署網址（`https://script.google.com/macros/s/.../exec`）
+   - **Scopes**：勾 `chat_message.write`
+   - **Bot link feature**：On (Normal)，選你的官方帳號
+3. 複製產生的 **LIFF ID**（像 `2001234567-AbCdEfGh`）。
+4. Apps Script → **⚙️ 專案設定 → 指令碼屬性 → 新增**：屬性 `LIFF_ID`，值貼上 LIFF ID。
+5. channel 狀態如果是 **Developing**，改成 **Published**，家人才打得開。
+
+LINE Login channel 裡沒有 LIFF 分頁的話，改建 **LINE MINI App** channel，一樣能拿到 LIFF ID。
+
 ### 📈 作息報表（網頁）
 輸入 `報表`（或點「📈 報表」按鈕），bot 會回一個只屬於你們聊天室的連結，在 LINE 裡就能打開：
 

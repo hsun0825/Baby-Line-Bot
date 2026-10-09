@@ -111,6 +111,20 @@ function reportUrl(chatId) {
   return key ? base + '?r=' + key : '';
 }
 
+/**
+ * 記錄表單的網址（kind：feed／diaper／other）。
+ * 有設定 LIFF_ID 時用 LIFF 打開（從聊天室下方滑出半個畫面）；沒有就用一般網頁（全螢幕）。
+ */
+function formUrl(chatId, kind) {
+  const base = webAppUrl();
+  const key = base && reportKey(chatId);
+  if (!key) return '';
+  const query = '?r=' + key + '&add=' + kind;
+  const p = props();
+  const liffId = p && p.getProperty('LIFF_ID');
+  return liffId ? 'https://liff.line.me/' + liffId.trim() + query : base + query;
+}
+
 /** 記錄者的 LINE 顯示名稱（查過一次就記起來）；查不到就用 userId */
 function recorderName(source) {
   const userId = source && source.userId;
@@ -191,9 +205,29 @@ function checkSetup() {
   return lines.join('\n');
 }
 
-// 用瀏覽器打開部署網址會看到「運作中」；帶著報表密碼（?r=...）則是寶寶作息報表
+/**
+ * 網址參數。從 LIFF 打開時，LINE 會先把 ?r=...&add=... 包在 liff.state 裡傳過來，這裡把它拆開。
+ */
+function pageParams(e) {
+  const params = {};
+  const raw = (e && e.parameter) || {};
+  Object.keys(raw).forEach(function (k) { params[k] = raw[k]; });
+  const state = params['liff.state'];
+  if (state) {
+    String(state).replace(/^[^?]*\?/, '').split('&').forEach(function (pair) {
+      const i = pair.indexOf('=');
+      if (i > 0) params[decodeURIComponent(pair.slice(0, i))] = decodeURIComponent(pair.slice(i + 1));
+    });
+  }
+  return params;
+}
+
+const FORM_KINDS = { feed: 'feed', diaper: 'diaper', other: 'temp' };
+
+// 用瀏覽器打開部署網址會看到「運作中」；帶著報表密碼（?r=...）則是寶寶作息報表，再加上 &add=feed 則是記錄表單
 function doGet(e) {
-  const key = e && e.parameter && e.parameter.r;
+  const params = pageParams(e);
+  const key = params.r;
   if (!key) return ContentService.createTextOutput('寶寶紀錄 bot 運作中 👶');
   const chatId = chatForReportKey(key);
   if (!chatId) {
@@ -201,8 +235,11 @@ function doGet(e) {
       .addMetaTag('viewport', 'width=device-width, initial-scale=1');
   }
   const service = new BabyService(new SheetStorage());
-  return HtmlService.createHtmlOutput(reportHtml(key, service.reportData(chatId, new Date())))
-    .setTitle('寶寶作息報表')
+  const mode = FORM_KINDS[params.add] || null;
+  const p = props();
+  const liffId = (p && p.getProperty('LIFF_ID')) || '';
+  return HtmlService.createHtmlOutput(reportHtml(key, service.reportData(chatId, new Date()), mode, liffId.trim()))
+    .setTitle(mode ? '記錄' : '寶寶作息報表')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
@@ -271,13 +308,14 @@ function handleEvent(service, event) {
   if (event.type !== 'message' || !event.message || event.message.type !== 'text') return;
   const source = event.source || {};
   // 名字只在真的要記錄時才查（傳函式進去，看不懂的聊天訊息就不會多打一次 LINE API）
-  const reply = service.handle(chatIdOf(source), event.message.text, function () { return recorderName(source); });
+  const chatId = chatIdOf(source);
+  const reply = service.handle(chatId, event.message.text, function () { return recorderName(source); });
   if (!reply) {
     // 群組裡看不懂就安靜；一對一聊天時提示一下，免得以為已經記好了
-    if (source.type === 'user') replyText(event.replyToken, '🤔 看不懂這則訊息，所以沒有記錄。\n輸入「說明」可以看所有指令。');
+    if (source.type === 'user') replyText(event.replyToken, '🤔 看不懂這則訊息，所以沒有記錄。\n輸入「說明」可以看所有指令。', quickActions(chatId));
     return;
   }
-  replyMessage(event.replyToken, reply);
+  replyMessage(event.replyToken, reply, quickActions(chatId));
 }
 
 // 群組／聊天室共用同一份紀錄，讓爸媽一起記；一對一聊天則以使用者為單位
@@ -285,30 +323,48 @@ function chatIdOf(source) {
   return source.groupId || source.roomId || source.userId;
 }
 
-// 每則回覆下方的快速按鈕（LINE 最多 13 個）
+// 每則回覆下方的快速按鈕（LINE 最多 13 個）。拿不到網址時用的文字版本。
 const QUICK_ACTIONS = [
   ['🍼 餵奶', '餵奶'],
   ['😴 睡覺', '睡覺'],
   ['☀️ 起床', '起床'],
   ['💧 尿', '尿布 尿'],
   ['💩 便', '尿布 便'],
-  ['🛁 洗澡', '洗澡'],
   ['⏱️ 狀態', '狀態'],
   ['📊 今天', '今天'],
   ['📈 報表', '報表'],
-  ['📋 最近', '最近'],
-  ['📏 成長', '成長紀錄'],
   ['↩️ 復原', '復原'],
 ];
 
-/** reply 可以是文字、{ text, quick }，或 { flex, altText, quick }（圖卡） */
-function replyMessage(replyToken, reply) {
-  if (typeof reply === 'string') return replyText(replyToken, reply);
-  if (reply.flex) return sendReply(replyToken, { type: 'flex', altText: reply.altText, contents: reply.flex }, reply.quick);
-  return replyText(replyToken, reply.text, reply.quick);
+/**
+ * 這個聊天室的快速按鈕：「餵奶」、「尿布」、「其他」點了會打開記錄表單，
+ * 其他按鈕直接送出文字。按鈕的第二格是文字，或 { uri: 網址 }。
+ */
+function quickActions(chatId) {
+  const feed = formUrl(chatId, 'feed');
+  if (!feed) return QUICK_ACTIONS;
+  return [
+    ['🍼 餵奶', { uri: feed }],
+    ['😴 睡覺', '睡覺'],
+    ['☀️ 起床', '起床'],
+    ['🧷 尿布', { uri: formUrl(chatId, 'diaper') }],
+    ['＋ 其他', { uri: formUrl(chatId, 'other') }],
+    ['⏱️ 狀態', '狀態'],
+    ['📊 今天', '今天'],
+    ['📈 報表', '報表'],
+    ['↩️ 復原', '復原'],
+  ];
 }
 
-/** quick 是快速按鈕 [[標籤, 送出的文字], ...]，沒給就用預設的 QUICK_ACTIONS */
+/** reply 可以是文字、{ text, quick }，或 { flex, altText, quick }（圖卡）；回覆沒指定按鈕時用 defaultQuick */
+function replyMessage(replyToken, reply, defaultQuick) {
+  if (typeof reply === 'string') return replyText(replyToken, reply, defaultQuick);
+  const quick = reply.quick || defaultQuick;
+  if (reply.flex) return sendReply(replyToken, { type: 'flex', altText: reply.altText, contents: reply.flex }, quick);
+  return replyText(replyToken, reply.text, quick);
+}
+
+/** quick 是快速按鈕 [[標籤, 送出的文字或 { uri }], ...]，沒給就用預設的 QUICK_ACTIONS */
 function replyText(replyToken, text, quick) {
   return sendReply(replyToken, { type: 'text', text: text.slice(0, 5000) }, quick);
 }
@@ -316,7 +372,10 @@ function replyText(replyToken, text, quick) {
 function sendReply(replyToken, message, quick) {
   message.quickReply = {
     items: (quick || QUICK_ACTIONS).slice(0, 13).map(function (a) {
-      return { type: 'action', action: { type: 'message', label: a[0], text: a[1] } };
+      const action = a[1] && a[1].uri
+        ? { type: 'uri', label: a[0], uri: a[1].uri }
+        : { type: 'message', label: a[0], text: a[1] };
+      return { type: 'action', action: action };
     }),
   };
   const res = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
@@ -1669,10 +1728,12 @@ BabyService.prototype.reportData = function (chatId, now) {
 // ======== 報表網頁 ========
 
 /** 把資料放進報表網頁（JSON 裡的 < 先轉義，避免資料內容被當成 HTML） */
-function reportHtml(key, data) {
+function reportHtml(key, data, mode, liffId) {
   const json = JSON.stringify(data).replace(/</g, '\\u003c');
   return REPORT_HTML
     .replace('__KEY__', function () { return JSON.stringify(key); })
+    .replace('__MODE__', function () { return JSON.stringify(mode || null); })
+    .replace('__LIFF__', function () { return JSON.stringify(liffId || ''); })
     .replace('__DATA__', function () { return json; });
 }
 
@@ -1770,6 +1831,16 @@ th { color: var(--ink-2); font-weight: 600; }
 .preview-line { font-size: 13px; color: var(--ink-2); background: var(--page); border-radius: 8px; padding: 8px 10px; }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(70px + env(safe-area-inset-bottom, 0px)); z-index: 30; background: var(--chip-on); color: var(--chip-on-ink); padding: 9px 14px; border-radius: 10px; font-size: 13px; max-width: calc(100% - 32px); box-shadow: 0 4px 16px rgba(0,0,0,.2); white-space: pre-line; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+/* 從快速按鈕打開時：只顯示記錄表單 */
+body.form-mode .wrap, body.form-mode .addbar { display: none; }
+body.form-mode .overlay { position: static; background: transparent; display: block; }
+body.form-mode { background: var(--surface); }
+body.form-mode .sheet { border-radius: 0; max-height: none; min-height: 100vh; margin: 0 auto; }
+.done { display: flex; flex-direction: column; gap: 10px; }
+.done-msg { white-space: pre-line; font-size: 15px; background: var(--page); border-radius: 10px; padding: 12px; }
+.done-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.done-actions .btn { flex: 1 1 auto; }
+form.is-done > :not(.sheet-head):not(.done) { display: none !important; }
 </style>
 </head>
 <body>
@@ -1872,12 +1943,22 @@ th { color: var(--ink-2); font-weight: 600; }
     <div class="preview-line" id="f-preview"></div>
     <div class="err" id="f-err" role="alert"></div>
     <button class="btn primary" type="submit" id="f-submit">補登</button>
-    <p class="note">會直接寫進試算表，跟在 LINE 打「10/6 14:30 配方奶 120」的效果一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
+    <div class="done" id="done" hidden>
+      <div class="done-msg" id="done-msg"></div>
+      <div class="done-actions">
+        <button class="btn" type="button" id="done-again">再記一筆</button>
+        <button class="btn" type="button" id="done-report">看報表</button>
+        <button class="btn primary" type="button" id="done-close">關閉</button>
+      </div>
+    </div>
+    <p class="note" id="f-note">會直接寫進試算表，跟在 LINE 打「10/6 14:30 配方奶 120」的效果一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
   </form>
 </div>
 
 <script>
 var KEY = __KEY__;
+var MODE = __MODE__;
+var LIFF_ID = __LIFF__;
 var DATA = __DATA__;
 (function () {
   var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, OFF = 8 * HOUR;
@@ -2292,7 +2373,7 @@ var DATA = __DATA__;
   }
   function update() {
     var line = describeForm(payload());
-    $('f-preview').textContent = line ? '將補登：' + line : '';
+    $('f-preview').textContent = line ? (MODE ? '將記錄：' : '將補登：') + line : '';
     $('f-preview').hidden = !line;
     $('f-err').textContent = '';
   }
@@ -2309,9 +2390,60 @@ var DATA = __DATA__;
     $('f-kg').value = lastKg();
     overlay.hidden = false;
     setKind(o.kind || kind);
-    $('f-time').focus();
+    if (!MODE) $('f-time').focus(); // 從按鈕打開時不要直接跳出鍵盤
   }
-  function closeForm() { overlay.hidden = true; if (lastFocus && lastFocus.focus) lastFocus.focus(); }
+  function closeForm() {
+    if (MODE) { closeWindow(); return; }
+    overlay.hidden = true; if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+
+  // ---------- LIFF（從聊天室下方滑出的視窗） ----------
+  var liffReady = false;
+  function closeWindow() {
+    if (liffReady) { try { liff.closeWindow(); return; } catch (e) {} }
+    try { window.top.close(); } catch (e) {}
+    $('done-msg').textContent = ($('done-msg').textContent ? $('done-msg').textContent + '\n\n' : '') + '往下滑或點左上角的 ✕ 就能關閉這個視窗。';
+  }
+  if (LIFF_ID) {
+    var sdk = document.createElement('script');
+    sdk.src = 'https://static.line-scdn.net/liff/edge/2/sdk.js';
+    sdk.onload = function () {
+      try { liff.init({ liffId: LIFF_ID }).then(function () { liffReady = true; }).catch(function () {}); } catch (e) {}
+    };
+    document.head.appendChild(sdk);
+  }
+  // 跟在 LINE 打字一樣的指令；今天的話省略日期，剛剛的話連時間也省略
+  function commandText(p) {
+    var today = p.day === DATA.today, nowHm = hm(DATA.now);
+    var near = today && Math.abs((Number(p.time.slice(0, 2)) * 60 + Number(p.time.slice(3))) - (Number(nowHm.slice(0, 2)) * 60 + Number(nowHm.slice(3)))) <= 5;
+    var date = today ? '' : md(p.day) + ' ';
+    var when = date + (near ? '' : p.time + ' ');
+    if (kind === 'feed') return when + p.feedType + ' ' + p.amount;
+    if (kind === 'sleep') return date + '睡 ' + p.time + '-' + p.end;
+    if (kind === 'diaper') return when + '尿布 ' + { pee: '尿', poo: '便', both: '尿+便' }[p.diaper];
+    if (kind === 'temp') return when + '體溫 ' + p.temp;
+    return when + '體重 ' + p.kg;
+  }
+  function chatContext() {
+    if (!liffReady) return null;
+    try { var c = liff.getContext(); return c && (c.type === 'utou' || c.type === 'group' || c.type === 'room') ? c : null; } catch (e) { return null; }
+  }
+  function showDone(message) {
+    form.classList.add('is-done');
+    $('done').hidden = false;
+    $('done-msg').textContent = message;
+    $('done-close').focus();
+  }
+  $('done-again').addEventListener('click', function () {
+    form.classList.remove('is-done'); $('done').hidden = true;
+    openForm({ kind: kind });
+  });
+  $('done-report').addEventListener('click', function () {
+    MODE = null; document.body.classList.remove('form-mode');
+    form.classList.remove('is-done'); $('done').hidden = true; overlay.hidden = true;
+    drawAll(); scrollTo(0, 0);
+  });
+  $('done-close').addEventListener('click', closeWindow);
   $('add-btn').addEventListener('click', function () { openForm(); });
   $('add-close').addEventListener('click', closeForm);
   overlay.addEventListener('click', function (e) { if (e.target === overlay) closeForm(); });
@@ -2322,27 +2454,47 @@ var DATA = __DATA__;
     if (saving) return;
     var p = payload();
     if (!describeForm(p)) { $('f-err').textContent = '請把時間和數值填完整'; return; }
-    if (typeof google === 'undefined' || !google.script || !google.script.run) { $('f-err').textContent = '請從 LINE 裡的報表連結打開這個頁面，才能補登。'; return; }
+    var label = MODE ? '記錄' : '補登';
     saving = true; $('f-submit').disabled = true; $('f-submit').textContent = '儲存中…';
-    function done() { saving = false; $('f-submit').disabled = false; $('f-submit').textContent = '補登'; }
-    google.script.run
-      .withSuccessHandler(function (res) {
-        done();
-        if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || '補登失敗，請再試一次。'; return; }
-        DATA = res.data;
-        closeForm();
-        drawAll();
-        toast(res.message);
-      })
-      .withFailureHandler(function (err) { done(); $('f-err').textContent = '補登失敗：' + (err && err.message ? err.message : err); })
-      .webAddRecord(KEY, p);
+    function done() { saving = false; $('f-submit').disabled = false; $('f-submit').textContent = label; }
+    function saveDirectly() {
+      if (typeof google === 'undefined' || !google.script || !google.script.run) { done(); $('f-err').textContent = '請從 LINE 裡的連結打開這個頁面，才能記錄。'; return; }
+      google.script.run
+        .withSuccessHandler(function (res) {
+          done();
+          if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || label + '失敗，請再試一次。'; return; }
+          DATA = res.data;
+          if (MODE) { showDone(res.message); return; }
+          closeForm();
+          drawAll();
+          toast(res.message);
+        })
+        .withFailureHandler(function (err) { done(); $('f-err').textContent = label + '失敗：' + (err && err.message ? err.message : err); })
+        .webAddRecord(KEY, p);
+    }
+    // 在 LINE 裡打開時，直接以你的名義把指令傳到聊天室，bot 會照常回覆；不行的話改成直接寫進試算表
+    if (MODE && chatContext()) {
+      liff.sendMessages([{ type: 'text', text: commandText(p) }])
+        .then(function () { done(); liff.closeWindow(); })
+        .catch(saveDirectly);
+      return;
+    }
+    saveDirectly();
   });
   var tt;
   function toast(s) { var t = $('toast'); t.textContent = s; t.hidden = false; clearTimeout(tt); tt = setTimeout(function () { t.hidden = true; }, 3500); }
 
   function drawAll() { drawHeader(); drawTiles(); drawGaps(); drawRhythm(); drawTrends(); drawGrowth(); }
-  drawAll();
-  var rt; addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(drawAll, 120); });
+  if (MODE) {
+    document.body.classList.add('form-mode');
+    $('add-h').textContent = { feed: '🍼 記錄餵奶', diaper: '🧷 記錄尿布' }[MODE] || '＋ 記錄';
+    $('f-submit').textContent = '記錄';
+    $('f-note').textContent = '補錯了可以在 LINE 輸入「復原」刪掉。';
+    openForm({ kind: MODE });
+  } else {
+    drawAll();
+  }
+  var rt; addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { if (!MODE) drawAll(); }, 120); });
 })();
 </script>
 </body>

@@ -271,7 +271,7 @@ test('doPost 回覆 LINE 訊息', () => {
   assert.equal(sent.length, 1); // 「哈哈」不回應
   assert.equal(sent[0].url, 'https://api.line.me/v2/bot/message/reply');
   assert.match(sent[0].body.messages[0].text, /喝奶 90ml/);
-  assert.equal(sent[0].body.messages[0].quickReply.items.length, 12);
+  assert.equal(sent[0].body.messages[0].quickReply.items.length, 9);
   // 只打「餵奶」會用按鈕問種類
   ctx.doPost({ postData: { contents: JSON.stringify({ events: [event('餵奶')] }) } });
   const items = sent[1].body.messages[0].quickReply.items.map((i) => i.action.text);
@@ -667,7 +667,7 @@ test('token 存在指令碼屬性、記錄者顯示名字、一對一看不懂�
   post(group, '今天');
   const msg = sent[sent.length - 1].body.messages[0];
   assert.equal(msg.type, 'flex');
-  assert.equal(msg.quickReply.items.length, 12);
+  assert.equal(msg.quickReply.items.length, 9);
 });
 
 test('報表網頁的 JavaScript 可以解析', () => {
@@ -712,4 +712,54 @@ test('token 前後有空白也能用；中文提示文字當作沒填', () => {
   // 之後換回提示文字，仍然用存起來的
   assert.equal(withToken('把你的 Channel access token 貼在這裡').lineToken(), real);
   assert.equal(withToken('').lineToken(), real);
+});
+
+test('快速按鈕打開記錄表單（有 LIFF 用 LIFF，沒有用一般網址）', () => {
+  const ss = new FakeSpreadsheet();
+  const props = new FakeProperties();
+  props.setProperty('LINE_CHANNEL_ACCESS_TOKEN', 'T'.repeat(30));
+  const sent = [];
+  const ctx = load({
+    SpreadsheetApp: { getActiveSpreadsheet: () => ss }, PropertiesService: { getScriptProperties: () => props },
+    Utilities: FakeUtilities, ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) },
+    ContentService: { createTextOutput: (t) => t },
+    HtmlService: { createHtmlOutput: (html) => ({ html, setTitle(t) { this.title = t; return this; }, addMetaTag() { return this; } }) },
+    UrlFetchApp: {
+      fetch: (url, opts) => {
+        if (opts.payload) sent.push(JSON.parse(opts.payload));
+        return { getResponseCode: () => 200, getContentText: () => '{}' };
+      },
+    },
+  });
+  const post = (text) => ctx.doPost({ postData: { contents: JSON.stringify({ events: [{ type: 'message', replyToken: 'r', source: { type: 'user', userId: 'U1' }, message: { type: 'text', text } }] }) } });
+  post('說明');
+  let items = sent[0].messages[0].quickReply.items.map((i) => i.action);
+  assert.deepEqual(items.map((a) => a.label), ['🍼 餵奶', '😴 睡覺', '☀️ 起床', '🧷 尿布', '＋ 其他', '⏱️ 狀態', '📊 今天', '📈 報表', '↩️ 復原']);
+  assert.equal(items[0].type, 'uri');
+  assert.match(items[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}&add=feed$/);
+  assert.equal(items[1].type, 'message');
+  assert.equal(items[1].text, '睡覺');
+  const key = items[0].uri.match(/r=([0-9a-f]{32})/)[1];
+
+  // 設定 LIFF_ID 之後改用 LIFF 網址
+  props.setProperty('LIFF_ID', ' 2001234567-AbCdEfGh ');
+  post('說明');
+  items = sent[1].messages[0].quickReply.items.map((i) => i.action);
+  assert.equal(items[3].uri, 'https://liff.line.me/2001234567-AbCdEfGh?r=' + key + '&add=diaper');
+  // 有自己按鈕的回覆（例如選餵奶種類）不會被蓋掉
+  post('配方奶');
+  assert.equal(sent[2].messages[0].quickReply.items[0].action.text, '配方奶 60');
+
+  // 表單頁：一般網址
+  let page = ctx.doGet({ parameter: { r: key, add: 'feed' } });
+  assert.equal(page.title, '記錄');
+  assert.ok(page.html.includes('var MODE = "feed";'));
+  assert.ok(page.html.includes('var LIFF_ID = "2001234567-AbCdEfGh";'));
+  // 從 LIFF 打開：參數包在 liff.state 裡
+  page = ctx.doGet({ parameter: { 'liff.state': '?r=' + key + '&add=other' } });
+  assert.ok(page.html.includes('var MODE = "temp";'));
+  // 報表本身不是表單模式
+  page = ctx.doGet({ parameter: { r: key } });
+  assert.equal(page.title, '寶寶作息報表');
+  assert.ok(page.html.includes('var MODE = null;'));
 });
