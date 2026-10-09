@@ -82,13 +82,28 @@ const FakeSpreadsheetApp = {
   },
 };
 
+class FakeProperties {
+  constructor() { this.data = {}; }
+  getProperty(k) { return Object.prototype.hasOwnProperty.call(this.data, k) ? this.data[k] : null; }
+  setProperty(k, v) { this.data[k] = String(v); return this; }
+}
+
+let uuid = 0;
+const FakeUtilities = { getUuid: () => `0000000${++uuid}-aaaa-bbbb-cccc-dddddddddddd`.slice(-36) };
+const WEB_URL = 'https://script.google.com/macros/s/TEST/exec';
+
 function load(extra = {}) {
   const ctx = vm.createContext({ console, ...extra });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'Code.gs'), 'utf8'), ctx);
   return ctx;
 }
 
-const G = load({ SpreadsheetApp: FakeSpreadsheetApp, Charts: { ChartType: { LINE: 'LINE' } } });
+const PROPS = new FakeProperties();
+const G = load({
+  SpreadsheetApp: FakeSpreadsheetApp, Charts: { ChartType: { LINE: 'LINE' } },
+  PropertiesService: { getScriptProperties: () => PROPS }, Utilities: FakeUtilities,
+  ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) },
+});
 const NOW = new Date('2026-10-07T15:00:00+08:00');
 const at = (h, m, day = 7) => new Date(`2026-10-${String(day).padStart(2, '0')}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+08:00`);
 const CHAT = 'C1';
@@ -182,7 +197,7 @@ test('今天統計', () => {
   svc.handle(CHAT, '尿布 尿', 'U', at(10, 0));
   svc.handle(CHAT, '體溫 37.6', 'U', at(10, 0));
   svc.handle(CHAT, '備註 打預防針', 'U', at(10, 30));
-  const s = svc.handle(CHAT, '今天', 'U', NOW);
+  const s = svc.handle(CHAT, '今天明細', 'U', NOW);
   assert.match(s, /餵食 3 次（共 270ml，親餵 10 分鐘）/);
   assert.match(s, /睡眠 6小時（1 段）/); // 只算 00:00 之後
   assert.match(s, /尿布 2 次（尿 2・便 1）/);
@@ -256,7 +271,7 @@ test('doPost 回覆 LINE 訊息', () => {
   assert.equal(sent.length, 1); // 「哈哈」不回應
   assert.equal(sent[0].url, 'https://api.line.me/v2/bot/message/reply');
   assert.match(sent[0].body.messages[0].text, /喝奶 90ml/);
-  assert.equal(sent[0].body.messages[0].quickReply.items.length, 11);
+  assert.equal(sent[0].body.messages[0].quickReply.items.length, 12);
   // 只打「餵奶」會用按鈕問種類
   ctx.doPost({ postData: { contents: JSON.stringify({ events: [event('餵奶')] }) } });
   const items = sent[1].body.messages[0].quickReply.items.map((i) => i.action.text);
@@ -339,7 +354,7 @@ test('擠奶當日總量與每日統計', () => {
   assert.match(svc.handle(CHAT, '擠奶 90', 'U', at(12, 0)), /今天共擠 200ml/);
   svc.handle(CHAT, '洗澡', 'U', at(19, 0, 6));
   svc.handle(CHAT, '洗澡', 'U', at(13, 0));
-  const s = svc.handle(CHAT, '今天', 'U', NOW);
+  const s = svc.handle(CHAT, '今天明細', 'U', NOW);
   assert.match(s, /🥛 擠奶 2 次（共 200ml）/);
   assert.match(s, /🛁 洗澡 1 次/);
 });
@@ -470,4 +485,196 @@ test('有指定時間時按鈕會帶著時間', () => {
   const r2 = svc.handle(CHAT, r.quick[2][1], 'U', NOW);
   assert.equal(r2.quick[0][1], '14:30 配方奶 60');
   assert.match(svc.handle(CHAT, r2.quick[0][1], 'U', NOW), /🍼 14:30 配方奶 60ml/);
+});
+
+// ---- 這次優化 ----
+
+test('指定日期補登', () => {
+  const { svc } = newService();
+  const cmd = G.parseCommand('10/5 14:30 配方奶 120', NOW);
+  assert.equal(cmd.at.getTime(), at(14, 30, 5).getTime());
+  assert.equal(cmd.dated, true);
+  // 今天的日期也不會把時間往前推一天；比現在晚就擋下來
+  assert.equal(G.parseCommand('10/7 09:00 尿布 尿', NOW).at.getTime(), at(9, 0).getTime());
+  assert.throws(() => G.parseCommand('10/7 23:00 喝奶 120', NOW), (e) => /比現在晚/.test(e.message));
+  assert.throws(() => G.parseCommand('10/5 喝奶 120', NOW), (e) => /要加上時間/.test(e.message));
+  // 睡眠區間：跨夜時結束在指定的那天
+  const sl = G.parseCommand('10/5 睡 22:00-06:00', NOW);
+  assert.equal(sl.at.getTime(), at(22, 0, 4).getTime());
+  assert.equal(sl.end.getTime(), at(6, 0, 5).getTime());
+  // 比今天晚的日期當作去年
+  assert.equal(G.parseCommand('12/25 10:00 洗澡', NOW).at.getUTCFullYear(), 2025);
+  // 不是日期就不理會
+  assert.equal(G.parseCommand('3/40 哈哈', NOW), null);
+  assert.equal(G.parseCommand('10/5 晚餐吃什麼', NOW), null);
+
+  svc.handle(CHAT, '喝奶 100', 'U', at(8, 0));
+  const r = svc.handle(CHAT, '10/5 14:30 配方奶 120', 'U', NOW);
+  assert.match(r, /已記錄（10\/05）\n🍼 14:30 配方奶 120ml/);
+  assert.doesNotMatch(r, /預計下一餐|再多記錄/); // 舊的餐不預測
+  // 按鈕也帶著日期
+  const ask = svc.handle(CHAT, '10/5 18:00 餵奶', 'U', NOW);
+  assert.equal(ask.quick[2][1], '10/05 18:00 配方奶');
+  assert.match(svc.handle(CHAT, '10/05 18:00 配方奶 150', 'U', NOW), /已記錄（10\/05）/);
+});
+
+test('補登睡眠不能重疊', () => {
+  const { svc } = newService();
+  svc.handle(CHAT, '睡 13:00-14:30', 'U', NOW);
+  assert.match(svc.handle(CHAT, '睡 14:00-15:00', 'U', NOW), /^⚠️ 這段睡眠跟已經記的「睡眠 13:00-14:30（1小時30分）」重疊了/);
+  assert.match(svc.handle(CHAT, '睡 14:30-15:00', 'U', NOW), /已補登（10\/07）/); // 剛好接著不算重疊
+  svc.handle(CHAT, '睡覺', 'U', at(15, 0));
+  assert.match(svc.handle(CHAT, '睡 15:10-15:20', 'U', at(15, 30)), /還在睡的話/);
+});
+
+test('忘了按起床會提醒', () => {
+  const { svc } = newService();
+  svc.handle(CHAT, '睡覺', 'U', at(1, 0));
+  assert.doesNotMatch(svc.handle(CHAT, '尿布 尿', 'U', at(3, 0)), /還沒記「起床」/); // 才 2 小時
+  const r = svc.handle(CHAT, '喝奶 120', 'U', at(9, 0));
+  assert.match(r, /寶寶從 10\/07 01:00 睡到現在還沒記「起床」（已 8小時）/);
+  assert.match(svc.handle(CHAT, '起床 07:30', 'U', at(9, 1)), /07:30 起床！\n這次睡了 6小時30分/);
+  assert.doesNotMatch(svc.handle(CHAT, '尿布 尿', 'U', at(9, 5)), /起床/);
+});
+
+test('寶寶設定', () => {
+  const { svc } = newService();
+  assert.match(svc.handle('S1', '設定', 'U', NOW), /生日：（未設定）/);
+  assert.match(svc.handle('S1', '設定 生日 2026/8/5', 'U', NOW), /生日：2026\/08\/05/);
+  assert.match(svc.handle('S1', '設定 性別 女', 'U', NOW), /性別：女/);
+  assert.match(svc.handle('S1', '設定 名字 小寶', 'U', NOW), /名字：小寶/);
+  assert.doesNotMatch(svc.handle('S1', '設定', 'U', NOW), /WHO/);
+  assert.match(svc.handle('S1', '設定 血型 A', 'U', NOW), /^⚠️ 可以設定的項目/);
+  assert.match(svc.handle('S1', '設定 生日 2026/2/30', 'U', NOW), /^⚠️ 生日日期不正確/);
+  assert.equal(G.getBabyInfo('S2').birth, undefined); // 每個聊天室分開
+});
+
+test('今日圖卡', () => {
+  const { svc } = newService();
+  assert.equal(svc.handle('F1', '今天', 'U', NOW), '📊 10/07（三）今天\n這天還沒有紀錄。');
+  svc.handle('F1', '喝奶 120', 'U', at(8, 0));
+  svc.handle('F1', '母乳 左 10', 'U', at(11, 0));
+  svc.handle('F1', '尿布 尿+便', 'U', at(9, 0));
+  svc.handle('F1', '體溫 38.2', 'U', at(10, 0));
+  const card = svc.handle('F1', '今天', 'U', NOW);
+  assert.match(card.altText, /^📊 10\/07（三）今天：餵食 2 次/);
+  const flat = JSON.stringify(card.flex);
+  assert.match(flat, /2 次 · 120ml · 親餵 10 分/);
+  assert.match(flat, /尿 1 · 便 1/);
+  assert.match(flat, /最高 38\.2°C ⚠️/);
+  assert.match(flat, /統計到 15:00 為止/);
+  const buttons = card.flex.footer.contents.map((b) => b.action);
+  assert.equal(buttons[0].type, 'uri');
+  assert.match(buttons[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}$/);
+  assert.deepEqual({ ...buttons[1] }, { type: 'message', label: '📋 看明細', text: '今天明細' });
+  assert.match(svc.handle('F1', '今天明細', 'U', NOW), /— 明細 —/);
+  assert.match(svc.handle('F1', '昨天', 'U', NOW), /10\/06（二）昨天\n這天還沒有紀錄/);
+});
+
+test('報表連結、網頁資料與網頁補登', () => {
+  const ss = new FakeSpreadsheet();
+  const ctx = load({
+    SpreadsheetApp: { getActiveSpreadsheet: () => ss }, PropertiesService: { getScriptProperties: () => PROPS },
+    Utilities: FakeUtilities, ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) },
+    LockService: undefined,
+    HtmlService: {
+      createHtmlOutput: (html) => ({ html, setTitle() { return this; }, addMetaTag() { return this; } }),
+    },
+    ContentService: { createTextOutput: (t) => t },
+  });
+  const svc = new ctx.BabyService(new ctx.SheetStorage(ss));
+  const r = svc.handle('R1', '報表', 'U', NOW);
+  const key = r.text.match(/\?r=([0-9a-f]{32})/)[1];
+  assert.equal(svc.handle('R1', '報表', 'U', NOW).text, r.text); // 同一個聊天室連結不變
+  assert.notEqual(svc.handle('R2', '報表', 'U', NOW).text, r.text);
+
+  svc.handle('R1', '喝奶 120', 'U', at(8, 0));
+  svc.handle('R1', '睡 22:00-06:00', 'U', at(8, 0));
+  svc.handle('R1', '尿布 尿+便', 'U', at(9, 0));
+  svc.handle('R1', '體重 5.9', 'U', at(9, 0));
+  svc.handle('R1', '備註 <script>alert(1)</script>', 'U', at(9, 0));
+  const data = svc.reportData('R1', NOW);
+  assert.equal(data.days.length, 30);
+  assert.deepEqual({ ...data.days[29] }, { d0: at(0, 0).getTime(), ml: 120, n: 1, breast: 0, sleepH: 6, gapH: null, pee: 1, poo: 1 });
+  assert.equal(data.sleeps.length, 1);
+  assert.equal(data.diapers.length, 2);
+  assert.equal(data.growth[0].v, 5.9);
+  assert.equal(data.lastFeed.label, '喝奶 120ml');
+
+  // doGet：沒有密碼顯示運作中；錯的密碼顯示失效；對的密碼顯示報表
+  assert.equal(ctx.doGet({ parameter: {} }), '寶寶紀錄 bot 運作中 👶');
+  assert.match(ctx.doGet({ parameter: { r: 'f'.repeat(32) } }).html, /失效/);
+  const page = ctx.doGet({ parameter: { r: key } }).html;
+  assert.match(page, /<title>寶寶作息報表<\/title>/);
+  assert.ok(page.includes('var KEY = "' + key + '";'));
+  assert.ok(!page.includes('__DATA__'));
+  assert.ok(!/<script>alert/.test(page.split('var DATA = ')[1])); // 資料裡的 < 有轉義
+
+  // 網頁補登會走跟 LINE 一樣的解析
+  const day5 = at(0, 0, 5).getTime();
+  const ok = ctx.webAddRecord(key, { kind: 'feed', day: day5, time: '14:30', feedType: '配方奶', amount: '150' });
+  assert.equal(ok.ok, true);
+  assert.match(ok.message, /🍼 14:30 配方奶 150ml/);
+  const rows = ss.sheets['紀錄'].rows;
+  assert.equal(rows[rows.length - 1][8], '網頁補登');
+  assert.equal(rows[rows.length - 1][3].getTime(), at(14, 30, 5).getTime());
+  assert.equal(ok.data.feeds.filter((f) => f.web).length, 1);
+
+  assert.equal(ctx.webAddRecord(key, { kind: 'sleep', day: day5, time: '22:00', end: '06:00' }).ok, true);
+  const clash = ctx.webAddRecord(key, { kind: 'sleep', day: day5, time: '23:00', end: '01:00' });
+  assert.equal(clash.ok, false);
+  assert.match(clash.message, /重疊/);
+  assert.equal(ctx.webAddRecord(key, { kind: 'diaper', day: day5, time: '09:00', diaper: 'both' }).ok, true);
+  assert.equal(ctx.webAddRecord(key, { kind: 'feed', day: day5, time: '09:00', feedType: '可樂', amount: '1' }).ok, false);
+  assert.equal(ctx.webAddRecord(key, { kind: 'temp', day: day5, time: '9點' }).ok, false);
+  assert.equal(ctx.webAddRecord('f'.repeat(32), { kind: 'diaper' }).ok, false);
+});
+
+test('token 存在指令碼屬性、記錄者顯示名字、一對一看不懂會提示', () => {
+  const ss = new FakeSpreadsheet();
+  const props = new FakeProperties();
+  props.setProperty('LINE_CHANNEL_ACCESS_TOKEN', 'SAVED');
+  const sent = [];
+  const lookups = [];
+  const ctx = load({
+    SpreadsheetApp: { getActiveSpreadsheet: () => ss },
+    PropertiesService: { getScriptProperties: () => props },
+    ContentService: { createTextOutput: (t) => t },
+    UrlFetchApp: {
+      fetch: (url, opts) => {
+        if (url.includes('/member/') || url.includes('/profile/')) {
+          lookups.push(url);
+          return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ displayName: '媽媽' }) };
+        }
+        sent.push({ body: JSON.parse(opts.payload), auth: opts.headers.Authorization });
+        return { getResponseCode: () => 200, getContentText: () => '{}' };
+      },
+    },
+  });
+  const post = (source, text) => ctx.doPost({ postData: { contents: JSON.stringify({ events: [{ type: 'message', replyToken: 'r', source, message: { type: 'text', text } }] }) } });
+  const group = { type: 'group', groupId: 'G9', userId: 'U9' };
+  post(group, '哈哈');
+  assert.equal(lookups.length, 0); // 看不懂的聊天不查名字
+  assert.equal(sent.length, 0);
+  post(group, '喝奶 90');
+  post(group, '尿布 尿');
+  assert.deepEqual(lookups, ['https://api.line.me/v2/bot/group/G9/member/U9']); // 只查一次
+  assert.equal(ss.sheets['紀錄'].rows[1][8], '媽媽');
+  assert.equal(sent[0].auth, 'Bearer SAVED');
+  post({ type: 'user', userId: 'U9' }, '哈哈');
+  assert.match(sent[sent.length - 1].body.messages[0].text, /看不懂這則訊息/);
+  // 今天 → Flex 圖卡
+  post(group, '今天');
+  const msg = sent[sent.length - 1].body.messages[0];
+  assert.equal(msg.type, 'flex');
+  assert.equal(msg.quickReply.items.length, 12);
+});
+
+test('報表網頁的 JavaScript 可以解析', () => {
+  const G2 = load({});
+  const html = G2.reportHtml('k', { a: 1 });
+  const script = html.split('<script>')[1].split('</script>')[0];
+  assert.doesNotThrow(() => new vm.Script(script));
+  assert.ok(script.includes("'\\n'") || script.includes('\\n'), '換行跳脫要保留');
+  assert.ok(script.includes('/(\\d+)ml/'), '正規表示式的反斜線要保留');
 });
