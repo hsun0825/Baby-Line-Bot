@@ -13,7 +13,6 @@ const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 
 // ===================================
 
-const TOKEN_PLACEHOLDER = '把你的 Channel access token 貼在這裡';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
@@ -47,16 +46,20 @@ function props() {
   return typeof PropertiesService === 'undefined' ? null : PropertiesService.getScriptProperties();
 }
 
+// LINE 的 token 是一長串英數字；還是中文提示文字（或空白）就當作沒填
+function isRealToken(t) {
+  return /^[\x21-\x7e]{20,}$/.test(String(t || '').trim());
+}
+
 /** 程式最上面有填 token 就用它（並存起來）；沒填就用之前存起來的 */
 function lineToken() {
   const p = props();
-  if (LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_ACCESS_TOKEN !== TOKEN_PLACEHOLDER) {
-    if (p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN') !== LINE_CHANNEL_ACCESS_TOKEN) {
-      p.setProperty('LINE_CHANNEL_ACCESS_TOKEN', LINE_CHANNEL_ACCESS_TOKEN);
-    }
-    return LINE_CHANNEL_ACCESS_TOKEN;
+  const typed = String(LINE_CHANNEL_ACCESS_TOKEN || '').trim();
+  if (isRealToken(typed)) {
+    if (p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN') !== typed) p.setProperty('LINE_CHANNEL_ACCESS_TOKEN', typed);
+    return typed;
   }
-  const saved = p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  const saved = p && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN') && p.getProperty('LINE_CHANNEL_ACCESS_TOKEN').trim();
   if (!saved) console.error('找不到 LINE token：請把 token 貼到程式最上面那行，存檔後重新部署（新版本）。');
   return saved || '';
 }
@@ -151,7 +154,10 @@ function doPost(e) {
 function setup() {
   new SheetStorage();
   const token = lineToken();
-  if (!token) throw new Error('請先把 Channel access token 貼到程式最上面，再執行一次 setup。');
+  if (!token) {
+    throw new Error('找不到 token。請確認程式最上面這行的引號裡是 LINE 的 Channel access token（一長串英數字）：\n' +
+      "const LINE_CHANNEL_ACCESS_TOKEN = '你的token';\n按儲存後再執行一次 setup。");
+  }
   UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
     headers: { Authorization: 'Bearer ' + token },
     muteHttpExceptions: true,

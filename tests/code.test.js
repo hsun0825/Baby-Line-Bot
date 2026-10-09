@@ -696,3 +696,20 @@ test('checkSetup 找出沒填 token', () => {
   assert.match(r, /✅ token 正確，LINE 官方帳號：寶寶日記/);
   assert.match(r, /✅ 部署網址：https:\/\/script\.google\.com/);
 });
+
+test('token 前後有空白也能用；中文提示文字當作沒填', () => {
+  const props = new FakeProperties();
+  const src = fs.readFileSync(path.join(__dirname, '..', 'Code.gs'), 'utf8');
+  const withToken = (t) => {
+    const ctx = vm.createContext({ console: { log() {}, error() {} }, PropertiesService: { getScriptProperties: () => props } });
+    vm.runInContext(src.replace("const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';",
+      'const LINE_CHANNEL_ACCESS_TOKEN = ' + JSON.stringify(t) + ';'), ctx);
+    return ctx;
+  };
+  const real = 'AbC123+/=xyzAbC123+/=xyzAbC123+/=';
+  assert.equal(withToken('  ' + real + '\n').lineToken(), real);
+  assert.equal(props.getProperty('LINE_CHANNEL_ACCESS_TOKEN'), real);
+  // 之後換回提示文字，仍然用存起來的
+  assert.equal(withToken('把你的 Channel access token 貼在這裡').lineToken(), real);
+  assert.equal(withToken('').lineToken(), real);
+});
