@@ -602,7 +602,7 @@ test('報表連結、網頁資料與網頁補登', () => {
   assert.equal(data.lastFeed.label, '喝奶 120ml');
 
   // doGet：沒有密碼顯示運作中；錯的密碼顯示失效；對的密碼顯示報表
-  assert.equal(ctx.doGet({ parameter: {} }), '寶寶紀錄 bot 運作中 👶');
+  assert.match(ctx.doGet({ parameter: {} }), /^寶寶紀錄 bot 運作中 👶（版本：.+）$/);
   assert.match(ctx.doGet({ parameter: { r: 'f'.repeat(32) } }).html, /失效/);
   const page = ctx.doGet({ parameter: { r: key } }).html;
   assert.match(page, /<title>寶寶作息報表<\/title>/);

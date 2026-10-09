@@ -13,6 +13,8 @@ const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 
 // ===================================
 
+// 程式版本：用瀏覽器打開部署網址會顯示，用來確認 LINE 用的是不是新程式
+const APP_VERSION = '2026-10-09 表單版';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
@@ -181,7 +183,7 @@ function setup() {
 
 // LINE 沒回應時，在編輯器裡選 checkSetup 按「執行」，看「執行記錄」裡哪一項打 ❌
 function checkSetup() {
-  const lines = [];
+  const lines = ['程式版本：' + APP_VERSION];
   const token = lineToken();
   if (!token) {
     lines.push('❌ 沒有 token：請把 Channel access token 貼到程式最上面那行，按儲存後再執行一次 checkSetup。');
@@ -200,6 +202,9 @@ function checkSetup() {
   const url = webAppUrl();
   lines.push(url ? '✅ 部署網址：' + url + '\n   （要跟 LINE Developers Console 的 Webhook URL 一樣）'
     : '❌ 還沒有部署成網頁應用程式：部署 → 新增部署作業 → 網頁應用程式');
+  const p = props();
+  const liffId = p && p.getProperty('LIFF_ID');
+  lines.push(liffId ? '✅ LIFF_ID：' + liffId + '（記錄表單會從下方滑出）' : 'ℹ️ 沒有設定 LIFF_ID：記錄表單會用全螢幕打開');
   lines.push('提醒：改完程式要「部署 → 管理部署作業 → ✏️ 編輯 → 版本選新版本 → 部署」，LINE 才會用到新程式。');
   console.log(lines.join('\n'));
   return lines.join('\n');
@@ -228,7 +233,7 @@ const FORM_KINDS = { feed: 'feed', diaper: 'diaper', other: 'temp' };
 function doGet(e) {
   const params = pageParams(e);
   const key = params.r;
-  if (!key) return ContentService.createTextOutput('寶寶紀錄 bot 運作中 👶');
+  if (!key) return ContentService.createTextOutput('寶寶紀錄 bot 運作中 👶（版本：' + APP_VERSION + '）');
   const chatId = chatForReportKey(key);
   if (!chatId) {
     return HtmlService.createHtmlOutput('<p style="font:16px sans-serif;padding:16px">這個報表連結已經失效了，請在 LINE 裡輸入「報表」拿新的連結。</p>')
