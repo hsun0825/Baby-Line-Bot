@@ -565,7 +565,8 @@ test('今日圖卡', () => {
   assert.match(flat, /統計到 15:00 為止/);
   const buttons = card.flex.footer.contents.map((b) => b.action);
   assert.equal(buttons[0].type, 'uri');
-  assert.match(buttons[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}$/);
+  assert.equal(buttons[0].label, '📖 打開寶寶日記');
+  assert.match(buttons[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}&view=day&d=\d+$/);
   assert.deepEqual({ ...buttons[1] }, { type: 'message', label: '📋 看明細', text: '今天明細' });
   assert.match(svc.handle('F1', '今天明細', 'U', NOW), /— 明細 —/);
   assert.match(svc.handle('F1', '昨天', 'U', NOW), /10\/06（二）昨天\n這天還沒有紀錄/);
@@ -605,7 +606,7 @@ test('報表連結、網頁資料與網頁補登', () => {
   assert.match(ctx.doGet({ parameter: {} }), /^寶寶紀錄 bot 運作中 👶（版本：.+）$/);
   assert.match(ctx.doGet({ parameter: { r: 'f'.repeat(32) } }).html, /失效/);
   const page = ctx.doGet({ parameter: { r: key } }).html;
-  assert.match(page, /<title>寶寶作息報表<\/title>/);
+  assert.match(page, /<title>寶寶日記<\/title>/);
   assert.ok(page.includes('var KEY = "' + key + '";'));
   assert.ok(!page.includes('__DATA__'));
   assert.ok(!/<script>alert/.test(page.split('var DATA = ')[1])); // 資料裡的 < 有轉義
@@ -734,34 +735,77 @@ test('快速按鈕打開記錄表單（有 LIFF 用 LIFF，沒有用一般網址
   const post = (text) => ctx.doPost({ postData: { contents: JSON.stringify({ events: [{ type: 'message', replyToken: 'r', source: { type: 'user', userId: 'U1' }, message: { type: 'text', text } }] }) } });
   post('說明');
   let items = sent[0].messages[0].quickReply.items.map((i) => i.action);
-  assert.deepEqual(items.map((a) => a.label), ['🍼 餵奶', '😴 睡覺', '☀️ 起床', '🧷 尿布', '＋ 其他', '⏱️ 狀態', '📊 今天', '📈 報表', '↩️ 復原']);
+  // 只留三個：＋ 記錄、睡覺（或起床）、寶寶日記
+  assert.deepEqual(items.map((a) => a.label), ['＋ 記錄', '😴 睡覺', '📖 寶寶日記']);
   assert.equal(items[0].type, 'uri');
-  assert.match(items[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}&add=feed$/);
+  assert.match(items[0].uri, /^https:\/\/script\.google\.com\/macros\/s\/TEST\/exec\?r=[0-9a-f]{32}&add=any$/);
   assert.equal(items[1].type, 'message');
   assert.equal(items[1].text, '睡覺');
+  assert.match(items[2].uri, /&view=today$/);
   const key = items[0].uri.match(/r=([0-9a-f]{32})/)[1];
+  // 寶寶在睡時，第二個按鈕變成「起床」
+  post('睡覺');
+  assert.deepEqual(sent[1].messages[0].quickReply.items.map((i) => i.action.label), ['＋ 記錄', '☀️ 起床', '📖 寶寶日記']);
 
   // 設定 LIFF_ID 之後改用 LIFF 網址
   props.setProperty('LIFF_ID', ' 2001234567-AbCdEfGh ');
   post('說明');
-  items = sent[1].messages[0].quickReply.items.map((i) => i.action);
-  assert.equal(items[3].uri, 'https://liff.line.me/2001234567-AbCdEfGh?r=' + key + '&add=diaper');
+  items = sent[2].messages[0].quickReply.items.map((i) => i.action);
+  assert.equal(items[0].uri, 'https://liff.line.me/2001234567-AbCdEfGh?r=' + key + '&add=any');
   // 有自己按鈕的回覆（例如選餵奶種類）不會被蓋掉
   post('配方奶');
-  assert.equal(sent[2].messages[0].quickReply.items[0].action.text, '配方奶 60');
+  assert.equal(sent[3].messages[0].quickReply.items[0].action.text, '配方奶 60');
 
-  // 表單頁：一般網址
-  let page = ctx.doGet({ parameter: { r: key, add: 'feed' } });
-  assert.equal(page.title, '記錄');
+  // 從「＋ 記錄」打開：一開始就跳出記錄表單
+  let page = ctx.doGet({ parameter: { r: key, add: 'any' } });
+  assert.equal(page.title, '寶寶日記');
   assert.ok(page.html.includes('var MODE = "feed";'));
   assert.ok(page.html.includes('var LIFF_ID = "2001234567-AbCdEfGh";'));
   // 從 LIFF 打開：參數包在 liff.state 裡
-  page = ctx.doGet({ parameter: { 'liff.state': '?r=' + key + '&add=other' } });
-  assert.ok(page.html.includes('var MODE = "temp";'));
-  // 報表本身不是表單模式
-  page = ctx.doGet({ parameter: { r: key } });
-  assert.equal(page.title, '寶寶作息報表');
+  page = ctx.doGet({ parameter: { 'liff.state': '?r=' + key + '&view=day&d=123' } });
   assert.ok(page.html.includes('var MODE = null;'));
+  assert.ok(page.html.includes('var VIEW = {"view":"day","day":123};'));
+  page = ctx.doGet({ parameter: { r: key, view: 'hack' } });
+  assert.ok(page.html.includes('var VIEW = {"view":"today","day":null};'));
+});
+
+test('日記、時間軸資料與刪除', () => {
+  const ss = new FakeSpreadsheet();
+  const ctx = load({
+    SpreadsheetApp: { getActiveSpreadsheet: () => ss }, PropertiesService: { getScriptProperties: () => PROPS },
+    Utilities: FakeUtilities, ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) },
+  });
+  const svc = new ctx.BabyService(new ctx.SheetStorage(ss));
+  // LINE 也能寫日記
+  assert.match(svc.handle('D1', '日記 今天第一次對我們笑了', '媽媽', NOW), /📖 15:00 日記 今天第一次對我們笑了/);
+  assert.match(svc.handle('D1', '日記', '媽媽', NOW), /日記紀錄（共 1 筆）/);
+  assert.match(svc.handle('D1', '寫日記', '媽媽', NOW), /^⚠️/);
+  assert.equal(ss.sheets['紀錄'].rows[1][2], '日記');
+
+  const key = ctx.reportKey('D1');
+  const now = Date.now();
+  let r = ctx.webAddDiary(key, { at: now - 3600000, mood: '🎉', text: '第一次翻身！\n好感動' });
+  assert.equal(r.ok, true);
+  const entry = r.data.diary[r.data.diary.length - 1];
+  assert.equal(entry.d, '🎉 第一次翻身！\n好感動'); // 保留換行
+  assert.equal(entry.k, 'diary');
+  assert.equal(r.data.records.filter((x) => x.k === 'diary').length, 0); // 日記不混進時間軸
+  assert.equal(ctx.webAddDiary(key, { at: now, text: '  ' }).ok, false);
+  assert.equal(ctx.webAddDiary(key, { at: now + 86400000, text: '未來' }).ok, false);
+  assert.equal(ctx.webAddDiary('f'.repeat(32), { at: now, text: 'x' }).ok, false);
+
+  // 時間軸紀錄帶著 id 和記錄者，刪除只能刪自己聊天室的
+  r = ctx.webAddRecord(key, { text: '配方奶 120' });
+  const feed = r.data.records.find((x) => x.k === 'feed');
+  assert.deepEqual({ k: feed.k, v: feed.v, u: feed.u, d: feed.d, by: feed.by }, { k: 'feed', v: 120, u: 'ml', d: '配方奶', by: '網頁補登' });
+  svc.handle('OTHER', '喝奶 90', 'U', NOW);
+  const otherId = ss.sheets['紀錄'].rows.filter((row) => row[1] === 'OTHER')[0][0];
+  assert.equal(ctx.webDeleteRecord(key, otherId).ok, false);
+  const del = ctx.webDeleteRecord(key, feed.id);
+  assert.equal(del.ok, true);
+  assert.match(del.message, /已刪除：.*配方奶 120ml/);
+  assert.equal(del.data.records.filter((x) => x.k === 'feed').length, 0);
+  assert.equal(ctx.webDeleteRecord(key, feed.id).ok, false);
 });
 
 test('新版表單送出文字指令：喝奶狀態、尿布顏色、睡眠計時，且不能執行其他指令', () => {

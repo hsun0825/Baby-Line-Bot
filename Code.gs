@@ -14,7 +14,7 @@ const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 // ===================================
 
 // 程式版本：用瀏覽器打開部署網址會顯示，用來確認 LINE 用的是不是新程式
-const APP_VERSION = '2026-10-11 療癒風表單';
+const APP_VERSION = '2026-10-11 寶寶日記 App';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
@@ -33,11 +33,12 @@ const BATH = 'bath';
 const PUMP = 'pump';
 const VACCINE = 'vaccine';
 const CLINIC = 'clinic';
+const DIARY = 'diary';
 
 // 試算表裡顯示的中文類型名稱
 const KIND_LABELS = {
   sleep: '睡眠', feed: '餵食', diaper: '排泄', temp: '體溫', note: '備註', growth: '成長',
-  med: '吃藥', bath: '洗澡', pump: '擠奶', vaccine: '疫苗', clinic: '看診',
+  med: '吃藥', bath: '洗澡', pump: '擠奶', vaccine: '疫苗', clinic: '看診', diary: '日記',
 };
 const LABEL_KINDS = {};
 Object.keys(KIND_LABELS).forEach(function (k) { LABEL_KINDS[KIND_LABELS[k]] = k; });
@@ -114,17 +115,21 @@ function reportUrl(chatId) {
 }
 
 /**
- * 記錄表單的網址（kind：feed／diaper／other）。
- * 有設定 LIFF_ID 時用 LIFF 打開（從聊天室下方滑出半個畫面）；沒有就用一般網頁（全螢幕）。
+ * 寶寶日記網頁的網址。query 例如 'add=feed'（直接打開記錄表單）或 'view=diary'。
+ * 有設定 LIFF_ID 時用 LIFF 打開（從聊天室下方滑出）；沒有就用一般網頁（全螢幕）。
  */
-function formUrl(chatId, kind) {
+function appUrl(chatId, query) {
   const base = webAppUrl();
   const key = base && reportKey(chatId);
   if (!key) return '';
-  const query = '?r=' + key + '&add=' + kind;
+  const q = '?r=' + key + (query ? '&' + query : '');
   const p = props();
   const liffId = p && p.getProperty('LIFF_ID');
-  return liffId ? 'https://liff.line.me/' + liffId.trim() + query : base + query;
+  return liffId ? 'https://liff.line.me/' + liffId.trim() + q : base + q;
+}
+
+function formUrl(chatId, kind) {
+  return appUrl(chatId, 'add=' + kind);
 }
 
 /** 記錄者的 LINE 顯示名稱（查過一次就記起來）；查不到就用 userId */
@@ -227,7 +232,8 @@ function pageParams(e) {
   return params;
 }
 
-const FORM_KINDS = { feed: 'feed', diaper: 'diaper', other: 'temp' };
+const FORM_KINDS = { feed: 'feed', diaper: 'diaper', other: 'temp', sleep: 'sleep', diary: 'diary', any: 'feed' };
+const VIEWS = ['today', 'day', 'diary', 'trend'];
 
 // 用瀏覽器打開部署網址會看到「運作中」；帶著報表密碼（?r=...）則是寶寶作息報表，再加上 &add=feed 則是記錄表單
 function doGet(e) {
@@ -241,10 +247,12 @@ function doGet(e) {
   }
   const service = new BabyService(new SheetStorage());
   const mode = FORM_KINDS[params.add] || null;
+  const view = VIEWS.indexOf(params.view) >= 0 ? params.view : 'today';
+  const day = Number(params.d) || null;
   const p = props();
   const liffId = (p && p.getProperty('LIFF_ID')) || '';
-  return HtmlService.createHtmlOutput(reportHtml(key, service.reportData(chatId, new Date()), mode, liffId.trim()))
-    .setTitle(mode ? '記錄' : '寶寶作息報表')
+  return HtmlService.createHtmlOutput(reportHtml(key, service.reportData(chatId, new Date()), mode, liffId.trim(), { view: view, day: day }))
+    .setTitle('寶寶日記')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
@@ -271,6 +279,45 @@ function webAddRecord(key, form) {
   const message = typeof reply === 'string' ? reply : (reply && reply.text) || '';
   if (/^⚠️/.test(message)) return { ok: false, message: message.replace(/^⚠️\s*/, '') };
   return { ok: true, message: message, data: service.reportData(chatId, now) };
+}
+
+/** 網頁「寫日記」：日記可以很長、可以換行，所以不走文字指令 */
+function webAddDiary(key, entry) {
+  const chatId = chatForReportKey(key);
+  if (!chatId) return { ok: false, message: '這個連結已經失效了，請在 LINE 裡輸入「報表」拿新的連結。' };
+  entry = entry || {};
+  const text = String(entry.text || '').replace(/\r\n?/g, '\n').trim().slice(0, 1000);
+  if (!text) return { ok: false, message: '請寫一點內容' };
+  const now = new Date();
+  const at = new Date(Number(entry.at));
+  if (isNaN(at.getTime()) || at > addMinutes(now, 5) || at < addMinutes(now, -400 * 24 * 60)) return { ok: false, message: '日期不正確' };
+  const mood = /^[^\s]{1,4}$/.test(entry.mood || '') ? entry.mood + ' ' : '';
+  const service = new BabyService(new SheetStorage());
+  withLock(function () {
+    service.storage.reset();
+    service.storage.add(chatId, DIARY, at, { detail: mood + text, userId: WEB_RECORDER });
+  });
+  return { ok: true, message: '📖 日記已儲存', data: service.reportData(chatId, now) };
+}
+
+/** 網頁時間軸的「刪除」：只能刪這個聊天室自己的紀錄 */
+function webDeleteRecord(key, id) {
+  const chatId = chatForReportKey(key);
+  if (!chatId) return { ok: false, message: '這個連結已經失效了，請在 LINE 裡輸入「報表」拿新的連結。' };
+  const service = new BabyService(new SheetStorage());
+  const now = new Date();
+  let removed = null;
+  withLock(function () {
+    const s = service.storage;
+    s.reset();
+    const rec = s._chat(chatId).filter(function (r) { return r.id === Number(id); })[0];
+    if (!rec) return;
+    s.remove(rec);
+    removed = rec;
+    if (rec.kind === GROWTH && s.updateGrowthSheet) s.updateGrowthSheet(chatId);
+  });
+  if (!removed) return { ok: false, message: '找不到這筆紀錄，可能已經被刪掉了。' };
+  return { ok: true, message: '🗑️ 已刪除：' + describe(removed, now).replace(/^\S+\s/, ''), data: service.reportData(chatId, now) };
 }
 
 /** 把網頁表單轉成跟 LINE 一樣的文字指令，讓兩邊用同一套解析和檢查 */
@@ -324,7 +371,7 @@ function handleEvent(service, event) {
     if (source.type === 'user') replyText(event.replyToken, '🤔 看不懂這則訊息，所以沒有記錄。\n輸入「說明」可以看所有指令。', quickActions(chatId));
     return;
   }
-  replyMessage(event.replyToken, reply, quickActions(chatId));
+  replyMessage(event.replyToken, reply, quickActions(chatId, !!service.storage.openSleep(chatId)));
 }
 
 // 群組／聊天室共用同一份紀錄，讓爸媽一起記；一對一聊天則以使用者為單位
@@ -346,22 +393,17 @@ const QUICK_ACTIONS = [
 ];
 
 /**
- * 這個聊天室的快速按鈕：「餵奶」、「尿布」、「其他」點了會打開記錄表單，
- * 其他按鈕直接送出文字。按鈕的第二格是文字，或 { uri: 網址 }。
+ * 這個聊天室的快速按鈕，只留最常用的三個：
+ * 「＋ 記錄」打開記錄表單、睡覺／起床（看寶寶現在是不是在睡）、「📖 寶寶日記」打開整個 App。
+ * 按鈕的第二格是文字，或 { uri: 網址 }。拿不到網址時用文字版本。
  */
-function quickActions(chatId) {
-  const feed = formUrl(chatId, 'feed');
-  if (!feed) return QUICK_ACTIONS;
+function quickActions(chatId, sleeping) {
+  const add = formUrl(chatId, 'any');
+  if (!add) return QUICK_ACTIONS;
   return [
-    ['🍼 餵奶', { uri: feed }],
-    ['😴 睡覺', '睡覺'],
-    ['☀️ 起床', '起床'],
-    ['🧷 尿布', { uri: formUrl(chatId, 'diaper') }],
-    ['＋ 其他', { uri: formUrl(chatId, 'other') }],
-    ['⏱️ 狀態', '狀態'],
-    ['📊 今天', '今天'],
-    ['📈 報表', '報表'],
-    ['↩️ 復原', '復原'],
+    ['＋ 記錄', { uri: add }],
+    sleeping ? ['☀️ 起床', '起床'] : ['😴 睡覺', '睡覺'],
+    ['📖 寶寶日記', { uri: appUrl(chatId, 'view=today') }],
   ];
 }
 
@@ -493,6 +535,7 @@ const BATH_WORDS = ['洗澡', '泡澡'];
 const PUMP_WORDS = ['擠奶', '擠母乳', '吸奶'];
 const VACCINE_WORDS = ['打疫苗', '疫苗', '預防針', '打針'];
 const CLINIC_WORDS = ['看診', '看醫生', '就醫', '門診', '回診'];
+const DIARY_WORDS = ['日記', '寫日記', '寶寶日記'];
 const EDIT_WORDS = ['修改', '更正'];
 const EXPORT_WORDS = ['匯出', '導出'];
 const SETTING_WORDS = ['設定', '設置'];
@@ -517,6 +560,7 @@ const HISTORY_WORDS = {
   看診紀錄: CLINIC, 就醫紀錄: CLINIC,
   體溫紀錄: TEMP,
   備註紀錄: NOTE,
+  日記: DIARY, 日記紀錄: DIARY, 寶寶日記: DIARY,
 };
 
 function normalizeText(text) {
@@ -683,7 +727,14 @@ function parsePump(rest, at) {
 
 /** 解析訊息本體（時間已經拿掉）。看不懂回傳 null。 */
 function parseBody(body, at) {
-  let word = startsWithWord(body, NOTE_WORDS);
+  let word = startsWithWord(body, DIARY_WORDS);
+  if (word) {
+    const text = body.slice(word.length).replace(/^[\s:：]+/, '').trim();
+    if (!text) throw new ParseError('請在「日記」後面寫上內容，例如：日記 今天第一次對我們笑了');
+    return record(DIARY, at, { detail: text.slice(0, 1000) });
+  }
+
+  word = startsWithWord(body, NOTE_WORDS);
   if (word) {
     const note = body.slice(word.length).replace(/^[\s:：]+/, '').trim();
     if (!note) throw new ParseError('請在「備註」後面加上內容，例如：備註 今天打預防針');
@@ -1037,6 +1088,7 @@ const HELP_TEXT = [
   '【疫苗】疫苗 五合一 第一劑',
   '【看診】看診 小兒科 感冒',
   '【備註】備註 今天第一次翻身',
+  '【日記】日記 今天第一次對我們笑了',
   '',
   '【補登時間】前面或後面加時間：',
   '14:30 喝奶 120 / 尿布 便 09:15',
@@ -1098,6 +1150,8 @@ function describe(rec, now) {
       return '💉 ' + t + ' 疫苗' + tail;
     case CLINIC:
       return '🏥 ' + t + ' 看診' + tail;
+    case DIARY:
+      return '📖 ' + t + ' 日記' + tail;
     case NOTE:
       return '📝 ' + t + tail;
     default:
@@ -1640,8 +1694,8 @@ BabyService.prototype.dayCard = function (chatId, start, now, label) {
   }
 
   const buttons = [];
-  const url = reportUrl(chatId);
-  if (url) buttons.push({ type: 'button', style: 'primary', color: '#2a78d6', height: 'sm', action: { type: 'uri', label: '📈 看完整報表', uri: url } });
+  const url = appUrl(chatId, 'view=day&d=' + start.getTime());
+  if (url) buttons.push({ type: 'button', style: 'primary', color: '#FF8F91', height: 'sm', action: { type: 'uri', label: '📖 打開寶寶日記', uri: url } });
   buttons.push({ type: 'button', style: 'secondary', height: 'sm', action: { type: 'message', label: '📋 看明細', text: label + '明細' } });
 
   return {
@@ -1680,6 +1734,14 @@ BabyService.prototype.do_report = function (chatId) {
       '⚠️ 這個連結可以看和新增紀錄，請不要轉傳給其他人。',
   };
 };
+
+/** 給網頁用的一筆紀錄（欄位名稱縮短，減少傳輸量） */
+function webRecord(r) {
+  return {
+    id: r.id, k: r.kind, s: r.start.getTime(), e: r.end ? r.end.getTime() : null,
+    v: r.value, u: r.unit || '', d: r.detail, by: r.userId && !/^U[0-9a-f]{32}$/.test(r.userId) ? r.userId : '',
+  };
+}
 
 /** 報表網頁需要的資料（時間都用毫秒，網頁再用台灣時間顯示） */
 BabyService.prototype.reportData = function (chatId, now) {
@@ -1731,6 +1793,10 @@ BabyService.prototype.reportData = function (chatId, now) {
     lastDiaper: lastDiaper ? { t: lastDiaper.start.getTime(), label: lastDiaper.detail } : null,
     sleeping: !!s.openSleep(chatId),
     sleepingSince: s.openSleep(chatId) ? s.openSleep(chatId).start.getTime() : null,
+    // 時間軸用：最近 31 天的每一筆紀錄（日記另外列出全部）
+    records: s.between(chatId, addMinutes(today, -30 * 24 * 60), addMinutes(now, 1))
+      .filter(function (r) { return r.kind !== DIARY; }).map(webRecord),
+    diary: s.ofKind(chatId, DIARY).slice(-200).map(webRecord),
     prediction: p ? { at: p.at.getTime(), amount: p.amount } : null,
   };
 };
@@ -1738,12 +1804,13 @@ BabyService.prototype.reportData = function (chatId, now) {
 // ======== 報表網頁 ========
 
 /** 把資料放進報表網頁（JSON 裡的 < 先轉義，避免資料內容被當成 HTML） */
-function reportHtml(key, data, mode, liffId) {
+function reportHtml(key, data, mode, liffId, opts) {
   const json = JSON.stringify(data).replace(/</g, '\\u003c');
   return REPORT_HTML
     .replace('__KEY__', function () { return JSON.stringify(key); })
     .replace('__MODE__', function () { return JSON.stringify(mode || null); })
     .replace('__LIFF__', function () { return JSON.stringify(liffId || ''); })
+    .replace('__VIEW__', function () { return JSON.stringify(opts || {}); })
     .replace('__DATA__', function () { return json; });
 }
 
@@ -1752,7 +1819,7 @@ const REPORT_HTML = String.raw`<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<title>寶寶作息報表</title>
+<title>寶寶日記</title>
 <style>
 /* 日系療癒風：奶油白底、珊瑚粉主色、各功能淺色底；卡片 20px 圓角、按鈕 16px、觸控範圍至少 44px */
 :root {
@@ -1785,7 +1852,7 @@ const REPORT_HTML = String.raw`<!DOCTYPE html>
 html, body { margin: 0; }
 body { background: var(--page); color: var(--ink); font-family: var(--font); font-size: 15px; line-height: 1.5; -webkit-text-size-adjust: 100%; }
 button, input, select { font: inherit; color: inherit; }
-.wrap { max-width: 560px; margin: 0 auto; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(96px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 16px; }
+.wrap { max-width: 560px; margin: 0 auto; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(110px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 16px; }
 header { display: flex; flex-direction: column; gap: 4px; }
 .eyebrow { color: var(--ink-2); font-size: 13px; }
 h1 { font-size: 24px; margin: 0; font-weight: 700; letter-spacing: .01em; }
@@ -1827,8 +1894,8 @@ th { color: var(--ink-2); font-weight: 600; }
 .btn { font-size: 15px; border: 0; border-radius: 16px; background: var(--page); color: var(--ink); padding: 10px 16px; min-height: 44px; cursor: pointer; font-weight: 600; }
 .btn.primary { background: var(--brand); color: var(--brand-ink); font-weight: 700; }
 .btn[disabled] { opacity: .6; cursor: progress; }
-.addbar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; pointer-events: none; z-index: 5; }
-.addbar .btn { pointer-events: auto; box-shadow: 0 6px 18px rgba(255,143,145,.45); border-radius: 999px; padding: 12px 24px; }
+.unused-addbar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; pointer-events: none; z-index: 5; }
+.unused-addbar .btn { pointer-events: auto; box-shadow: 0 6px 18px rgba(255,143,145,.45); border-radius: 999px; padding: 12px 24px; }
 .gaps { display: flex; flex-direction: column; gap: 8px; }
 .gap-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 10px 12px; border: 1px dashed var(--warn); border-radius: 16px; background: var(--warn-bg); }
 .gap-row b { font-weight: 700; }
@@ -1875,7 +1942,6 @@ th { color: var(--ink-2); font-weight: 600; }
 .sleep-now { background: var(--t-sleep); border-radius: 20px; padding: 16px; text-align: center; display: flex; flex-direction: column; gap: 4px; }
 .sleep-now .state { font-size: 15px; color: var(--ink-2); font-weight: 600; }
 .sleep-now .elapsed { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; }
-.sleep-now .elapsed.idle { font-size: 15px; font-weight: 600; color: var(--ink-2); }
 .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: var(--page); color: var(--ink-2); align-self: center; }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.crit { background: var(--brand-soft); color: var(--crit); }
@@ -1887,59 +1953,173 @@ th { color: var(--ink-2); font-weight: 600; }
 .err:empty { display: none; }
 .savebar { position: sticky; bottom: 0; margin: 0 -16px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to top, var(--page) 75%, transparent); }
 .savebar .btn { width: 100%; min-height: 56px; font-size: 18px; border-radius: 18px; box-shadow: 0 6px 18px rgba(255,143,145,.45); }
-.done { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px 0 calc(20px + env(safe-area-inset-bottom, 0px)); text-align: center; }
-.done-check { width: 72px; height: 72px; border-radius: 50%; background: var(--t-diaper); display: flex; align-items: center; justify-content: center; font-size: 34px; }
-.done-msg { white-space: pre-line; font-size: 16px; line-height: 1.6; }
-.done-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; width: 100%; }
-.done-actions .btn.primary { grid-column: 1 / -1; min-height: 52px; }
-.done-actions .btn:not(.primary) { background: var(--surface); box-shadow: var(--shadow); }
-form.is-done > :not(.sheet-head):not(.done):not(.grip) { display: none !important; }
 @media (prefers-reduced-motion: no-preference) {
   .overlay:not([hidden]) .sheet { animation: rise .22s ease-out; }
   @keyframes rise { from { transform: translateY(24px); opacity: .6; } }
   .toast { animation: fade .2s ease-out; } @keyframes fade { from { opacity: 0; } }
 }
-/* 從快速按鈕打開時：只顯示記錄表單 */
-body.form-mode .wrap, body.form-mode .addbar { display: none; }
-body.form-mode .overlay { position: static; background: transparent; display: block; }
-body.form-mode .sheet { border-radius: 0; max-height: none; min-height: 100vh; margin: 0 auto; padding-top: calc(8px + env(safe-area-inset-top, 0px)); animation: none; }
-body.form-mode .grip { display: none; }
 @media (max-width: 360px) { .stepper { grid-template-columns: 44px 44px minmax(0,1fr) 44px 44px; } .kind { font-size: 12px; } }
+
+/* ---------- App 版面：底部分頁 ---------- */
+.view[hidden] { display: none !important; }
+.tabbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 15; background: var(--surface); box-shadow: 0 -2px 14px rgba(69,51,44,.08);
+  display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); align-items: end; padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px)); }
+.tab { border: 0; background: none; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 2px; min-height: 50px; justify-content: center; font-size: 11px; font-weight: 600; cursor: pointer; }
+.tab .ic { font-size: 21px; line-height: 1; filter: grayscale(.6); opacity: .8; }
+.tab[aria-current="page"] { color: var(--ink); }
+.tab[aria-current="page"] .ic { filter: none; opacity: 1; }
+.tab.plus .ic { width: 56px; height: 56px; border-radius: 50%; background: var(--brand); color: var(--brand-ink); display: flex; align-items: center; justify-content: center; font-size: 30px; font-weight: 400; filter: none; opacity: 1;
+  box-shadow: 0 6px 16px rgba(255,143,145,.5); margin-top: -26px; }
+.tab.plus { color: var(--ink); }
+
+/* 首頁 */
+.baby { display: flex; align-items: center; gap: 12px; }
+.avatar { width: 56px; height: 56px; border-radius: 50%; background: var(--t-feed); display: flex; align-items: center; justify-content: center; font-size: 30px; flex: none; border: 0; cursor: pointer; }
+.baby h1 { font-size: 22px; }
+.baby .sub { font-size: 13px; color: var(--ink-2); }
+.hero { border-radius: 20px; padding: 16px; display: flex; flex-direction: column; gap: 6px; background: var(--surface); box-shadow: var(--shadow); }
+.hero .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hero .big-t { font-size: 26px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.hero .muted { font-size: 13px; color: var(--ink-2); }
+.qa { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+.qa button { border: 0; border-radius: 20px; min-height: 76px; padding: 12px; display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; color: var(--ink); cursor: pointer; text-align: left; box-shadow: var(--shadow); }
+.qa .ic { font-size: 28px; line-height: 1; }
+.qa small { display: block; font-size: 12px; font-weight: 500; color: var(--ink-2); }
+.qa .q-feed { background: var(--t-feed); } .qa .q-sleep { background: var(--t-sleep); } .qa .q-diaper { background: var(--t-diaper); } .qa .q-diary { background: var(--t-mile); }
+.tile { border: 0; text-align: left; cursor: pointer; color: var(--ink); }
+.banner { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-radius: 16px; padding: 12px 14px; background: var(--warn-bg); border: 1px dashed var(--warn); font-size: 14px; cursor: pointer; color: var(--ink); width: 100%; text-align: left; }
+.section-title { display: flex; justify-content: space-between; align-items: baseline; }
+.link { border: 0; background: none; color: var(--accent); font-weight: 700; font-size: 14px; cursor: pointer; min-height: 44px; padding: 0 4px; }
+
+/* 時間軸 */
+.daybar { display: grid; grid-template-columns: 48px minmax(0,1fr) 48px; gap: 8px; align-items: center; position: sticky; top: 0; z-index: 4; background: var(--page); padding: calc(6px + env(safe-area-inset-top, 0px)) 0 6px; }
+.daybar button.nav { border: 0; width: 48px; height: 48px; border-radius: 50%; background: var(--surface); box-shadow: var(--shadow); font-size: 20px; color: var(--ink); cursor: pointer; }
+.daybar button.nav[disabled] { opacity: .35; cursor: default; }
+.daypick { position: relative; text-align: center; background: var(--surface); border-radius: 16px; min-height: 48px; display: flex; flex-direction: column; justify-content: center; box-shadow: var(--shadow); }
+.daypick b { font-size: 17px; } .daypick span { font-size: 12px; color: var(--muted); }
+.daypick select { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; font-size: 16px; }
+.ribbon { background: var(--surface); border-radius: 20px; padding: 12px 14px 8px; box-shadow: var(--shadow); }
+.filters { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+.filters::-webkit-scrollbar { display: none; }
+.filters .pill { flex: none; background: var(--surface); box-shadow: var(--shadow); }
+.list { display: flex; flex-direction: column; gap: 8px; }
+.item { background: var(--surface); border-radius: 18px; box-shadow: var(--shadow); overflow: hidden; }
+.item-main { display: grid; grid-template-columns: 58px 40px minmax(0,1fr) 44px; align-items: center; gap: 8px; padding: 10px 6px 10px 12px; min-height: 60px; }
+.it-time { font-size: 15px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.it-time small { display: block; font-size: 11px; font-weight: 600; color: var(--muted); }
+.it-dot { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+.it-title { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+.it-sub { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.it-more { border: 0; background: none; width: 44px; height: 44px; border-radius: 50%; font-size: 20px; color: var(--muted); cursor: pointer; }
+.item.new { box-shadow: 0 0 0 2px var(--brand), var(--shadow); }
+.new-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 999px; background: var(--brand); color: var(--brand-ink); margin-left: 6px; vertical-align: 2px; }
+.item-actions { display: flex; gap: 8px; padding: 0 12px 12px; flex-wrap: wrap; }
+.item-actions .btn { flex: 1 1 auto; font-size: 14px; }
+.btn.danger { background: var(--brand-soft); color: var(--crit); }
+.confirm { width: 100%; font-size: 14px; color: var(--ink-2); }
+.gap { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; border: 1px dashed var(--warn); border-radius: 16px; background: var(--warn-bg); font-size: 13px; }
+.gap .btn { background: var(--surface); min-height: 40px; font-size: 14px; flex: none; }
+.c-feed { background: var(--t-feed); } .c-sleep { background: var(--t-sleep); } .c-diaper { background: var(--t-diaper); }
+.c-temp { background: var(--t-temp); } .c-growth { background: var(--t-weight); } .c-other { background: var(--t-mile); }
+.addday { width: 100%; border: 2px dashed var(--axis); background: none; border-radius: 18px; min-height: 52px; font-size: 15px; font-weight: 700; color: var(--ink-2); cursor: pointer; }
+.empty-card { text-align: center; padding: 24px 12px; color: var(--ink-2); background: var(--surface); border-radius: 20px; box-shadow: var(--shadow); }
+.empty-card .ic { font-size: 34px; }
+
+/* 日記 */
+.compose textarea { width: 100%; min-height: 120px; border: 0; border-radius: 14px; background: var(--page); padding: 12px; font-size: 16px; line-height: 1.6; color: var(--ink); resize: vertical; }
+.moods { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; }
+.moods .pill { flex: none; }
+.month { font-size: 13px; font-weight: 700; color: var(--muted); margin: 6px 4px 0; }
+.entry { background: var(--surface); border-radius: 20px; padding: 14px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }
+.entry .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.entry .date { font-weight: 700; } .entry .age { font-size: 12px; color: var(--muted); }
+.entry .mood { font-size: 26px; }
+.entry .body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.7; }
+.memory { background: var(--t-mile); border-radius: 20px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+
+/* 記錄表單：日期與時間 */
+.time-step { display: grid; grid-template-columns: 52px 52px minmax(0,1fr) 52px 52px; gap: 6px; }
+.time-field { position: relative; background: var(--brand-soft); border-radius: 14px; min-height: 56px; display: flex; align-items: center; justify-content: center; min-width: 0; cursor: pointer; }
+.time-field b { font-size: 28px; font-weight: 800; font-variant-numeric: tabular-nums; pointer-events: none; }
+.time-field input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; border: 0; cursor: pointer; font-size: 16px; }
+.day-chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.pill-select { position: relative; }
+.pill-select select { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; font-size: 16px; }
+.nearby ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.nearby li { display: flex; gap: 10px; font-size: 14px; align-items: baseline; }
+.nearby li b { font-variant-numeric: tabular-nums; min-width: 44px; }
+.nearby li.same { font-weight: 700; }
+.dup { background: var(--warn-bg); color: var(--ink); border-radius: 14px; padding: 10px 12px; font-size: 14px; font-weight: 600; }
+.dup:empty { display: none; }
+@media (max-width: 360px) { .time-step { grid-template-columns: 44px 44px minmax(0,1fr) 44px 44px; } .item-main { grid-template-columns: 52px 36px minmax(0,1fr) 40px; } }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="eyebrow" id="baby-line"></div>
-    <h1>寶寶作息報表</h1>
-    <p class="sub" id="asof"></p>
-  </header>
-
-  <section class="tiles" aria-label="今日摘要" id="tiles"></section>
-
-  <section class="panel" aria-labelledby="gaps-h" id="gaps-panel" hidden>
-    <div class="panel-head">
-      <h2 id="gaps-h">⚠️ 可能漏記</h2>
-      <span class="sub">餵奶間隔特別長的地方，點「補登」把漏掉的加回去</span>
+<main class="wrap">
+  <section class="view" id="v-today" aria-label="今天">
+    <div class="baby">
+      <button class="avatar" type="button" id="avatar" aria-label="寶寶資料">👶</button>
+      <div><h1 id="baby-name">寶寶</h1><div class="sub" id="baby-age"></div></div>
     </div>
-    <div class="gaps" id="gaps"></div>
+    <div class="hero" id="hero"></div>
+    <div class="qa">
+      <button type="button" class="q-feed" id="qa-feed"><span class="ic" aria-hidden="true">🍼</span><span>記錄喝奶<small id="qa-feed-sub"></small></span></button>
+      <button type="button" class="q-sleep" id="qa-sleep"><span class="ic" aria-hidden="true" id="qa-sleep-ic">🌙</span><span id="qa-sleep-txt">開始睡覺</span></button>
+      <button type="button" class="q-diaper" id="qa-diaper"><span class="ic" aria-hidden="true">🧷</span><span>記錄尿布<small id="qa-diaper-sub"></small></span></button>
+      <button type="button" class="q-diary" id="qa-diary"><span class="ic" aria-hidden="true">📖</span><span>寫日記<small>記下今天的小事</small></span></button>
+    </div>
+    <div class="section-title"><h2>今天</h2><button class="link" type="button" id="today-more">看時間軸 ›</button></div>
+    <div class="tiles" id="today-tiles"></div>
+    <button class="banner" type="button" id="gap-banner" hidden></button>
+    <div class="section-title"><h2>最近紀錄</h2></div>
+    <div class="list" id="recent"></div>
   </section>
 
-  <section class="panel" aria-labelledby="rhythm-h">
-    <div class="panel-head">
-      <h2 id="rhythm-h">24 小時作息圖</h2>
-      <span class="sub">點色塊看細節 · 點空白處補登</span>
+  <section class="view" id="v-day" aria-label="時間軸" hidden>
+    <div class="daybar">
+      <button class="nav" type="button" id="day-prev" aria-label="前一天">‹</button>
+      <div class="daypick"><b id="day-title"></b><span id="day-sub"></span><select id="day-select" aria-label="選擇日期"></select></div>
+      <button class="nav" type="button" id="day-next" aria-label="後一天">›</button>
     </div>
-    <div class="legend" aria-hidden="true">
-      <span><i class="sw" style="background:var(--sleep)"></i>睡眠</span>
-      <span><svg width="10" height="10" style="width:10px"><circle cx="5" cy="5" r="4" fill="var(--feed)"/></svg>餵奶</span>
-      <span><svg width="10" height="10" style="width:10px"><rect x="3" y="0" width="4" height="10" rx="1" fill="var(--pee)"/></svg>尿</span>
-      <span><svg width="10" height="10" style="width:10px"><rect x="0" y="3" width="10" height="4" rx="1" fill="var(--poo)"/></svg>便</span>
-      <span><i class="sw" style="background:var(--night)"></i>夜間 22–06</span>
+    <div class="tiles" id="day-tiles"></div>
+    <div class="ribbon"><div id="ribbon"></div></div>
+    <div class="filters" role="group" aria-label="篩選" id="filters">
+      <button type="button" class="pill" id="fl-all" data-v="all" aria-pressed="true">全部</button>
+      <button type="button" class="pill" id="fl-feed" data-v="feed" aria-pressed="false">🍼 喝奶</button>
+      <button type="button" class="pill" id="fl-sleep" data-v="sleep" aria-pressed="false">🌙 睡眠</button>
+      <button type="button" class="pill" id="fl-diaper" data-v="diaper" aria-pressed="false">🧷 尿布</button>
+      <button type="button" class="pill" id="fl-other" data-v="other" aria-pressed="false">其他</button>
     </div>
-    <div id="rhythm"></div>
+    <div class="list" id="day-list"></div>
+    <button class="addday" type="button" id="day-add"></button>
   </section>
 
+  <section class="view" id="v-diary" aria-label="日記" hidden>
+    <h1>寶寶日記</h1>
+    <div class="card compose">
+      <div class="day-chips" id="dy-days">
+        <button type="button" class="pill" id="dy-0" data-off="0" aria-pressed="true">今天</button>
+        <button type="button" class="pill" id="dy-1" data-off="1" aria-pressed="false">昨天</button>
+        <label class="pill pill-select"><span id="dy-more-label">其他日期 ▾</span><select id="dy-date" aria-label="日記日期"></select></label>
+      </div>
+      <div class="moods" role="group" aria-label="心情" id="dy-mood">
+        <button type="button" class="pill" id="mo-1" data-v="😊" aria-pressed="false">😊 開心</button>
+        <button type="button" class="pill" id="mo-2" data-v="🥰" aria-pressed="false">🥰 甜蜜</button>
+        <button type="button" class="pill" id="mo-3" data-v="🎉" aria-pressed="false">🎉 第一次</button>
+        <button type="button" class="pill" id="mo-4" data-v="😴" aria-pressed="false">😴 好睏</button>
+        <button type="button" class="pill" id="mo-5" data-v="😢" aria-pressed="false">😢 辛苦</button>
+        <button type="button" class="pill" id="mo-6" data-v="🤒" aria-pressed="false">🤒 不舒服</button>
+      </div>
+      <textarea id="dy-text" maxlength="1000" placeholder="今天想記下什麼？例如：第一次對著我們笑了"></textarea>
+      <div class="err" id="dy-err" role="alert"></div>
+      <button class="btn primary" type="button" id="dy-save">儲存日記</button>
+    </div>
+    <div id="memories"></div>
+    <div id="diary-list" class="list"></div>
+  </section>
+
+  <section class="view" id="v-trend" aria-label="趨勢" hidden>
+    <h1>趨勢與成長</h1>
   <section class="panel" aria-labelledby="trend-h">
     <div class="panel-head">
       <h2 id="trend-h">每日趨勢</h2>
@@ -1973,11 +2153,20 @@ body.form-mode .grip { display: none; }
     <p class="note" id="growth-note"></p>
   </section>
 
-  <p class="note">資料來自你們的試算表，每次打開都是最新的。這個連結可以看和新增紀錄，請不要轉傳給其他人。</p>
-</div>
+  <p class="note">資料來自你們的試算表。這個連結可以看和新增紀錄，請不要轉傳給其他人。</p>
+
+  </section>
+</main>
+
+<nav class="tabbar" aria-label="主選單">
+  <button class="tab" type="button" id="tab-today" data-view="today"><span class="ic" aria-hidden="true">🏠</span>今天</button>
+  <button class="tab" type="button" id="tab-day" data-view="day"><span class="ic" aria-hidden="true">🕒</span>時間軸</button>
+  <button class="tab plus" type="button" id="add-btn" aria-label="新增紀錄"><span class="ic" aria-hidden="true">＋</span>新增</button>
+  <button class="tab" type="button" id="tab-diary" data-view="diary"><span class="ic" aria-hidden="true">📖</span>日記</button>
+  <button class="tab" type="button" id="tab-trend" data-view="trend"><span class="ic" aria-hidden="true">📈</span>趨勢</button>
+</nav>
 
 <div class="tip" id="tip" hidden></div>
-<div class="addbar"><button class="btn primary" id="add-btn" type="button">＋ 新增紀錄</button></div>
 <div class="toast" id="toast" role="status" hidden></div>
 
 <div class="overlay" id="overlay" hidden>
@@ -1986,11 +2175,11 @@ body.form-mode .grip { display: none; }
     <div class="sheet-head"><h2 id="add-h">新增紀錄</h2><button class="x" type="button" id="add-close" aria-label="關閉">✕</button></div>
 
     <div class="kinds" role="group" aria-label="紀錄類型" id="kind-seg">
-      <button type="button" class="kind" id="k-feed" data-kind="feed" data-v="feed" aria-pressed="true"><span class="ic" aria-hidden="true">🍼</span>喝奶</button>
-      <button type="button" class="kind" id="k-sleep" data-kind="sleep" data-v="sleep" aria-pressed="false"><span class="ic" aria-hidden="true">🌙</span>睡眠</button>
-      <button type="button" class="kind" id="k-diaper" data-kind="diaper" data-v="diaper" aria-pressed="false"><span class="ic" aria-hidden="true">🧷</span>尿布</button>
-      <button type="button" class="kind" id="k-temp" data-kind="temp" data-v="temp" aria-pressed="false"><span class="ic" aria-hidden="true">🌡️</span>體溫</button>
-      <button type="button" class="kind" id="k-weight" data-kind="weight" data-v="weight" aria-pressed="false"><span class="ic" aria-hidden="true">⚖️</span>體重</button>
+      <button type="button" class="kind" id="k-feed" data-kind="feed" aria-pressed="true"><span class="ic" aria-hidden="true">🍼</span>喝奶</button>
+      <button type="button" class="kind" id="k-sleep" data-kind="sleep" aria-pressed="false"><span class="ic" aria-hidden="true">🌙</span>睡眠</button>
+      <button type="button" class="kind" id="k-diaper" data-kind="diaper" aria-pressed="false"><span class="ic" aria-hidden="true">🧷</span>尿布</button>
+      <button type="button" class="kind" id="k-temp" data-kind="temp" aria-pressed="false"><span class="ic" aria-hidden="true">🌡️</span>體溫</button>
+      <button type="button" class="kind" id="k-weight" data-kind="weight" aria-pressed="false"><span class="ic" aria-hidden="true">⚖️</span>體重</button>
     </div>
 
     <div class="card" data-for="sleep">
@@ -2005,17 +2194,38 @@ body.form-mode .grip { display: none; }
     </div>
 
     <div class="card">
-      <div class="when">
-        <label class="field"><span class="label">日期</span><select id="f-date"></select></label>
-        <label class="field"><span class="label" id="f-time-lab">時間</span><input type="time" id="f-time"></label>
+      <span class="label">日期</span>
+      <div class="day-chips" id="day-chips">
+        <button type="button" class="pill" id="dc-0" data-off="0">今天</button>
+        <button type="button" class="pill" id="dc-1" data-off="1">昨天</button>
+        <button type="button" class="pill" id="dc-2" data-off="2">前天</button>
+        <label class="pill pill-select" id="dc-more"><span id="dc-more-label">更早 ▾</span><select id="f-date" aria-label="選擇日期"></select></label>
       </div>
-      <label class="field" data-for="sleep-range"><span class="label">起床時間</span><input type="time" id="f-end"></label>
-      <div class="pills" id="when-chips" aria-label="快速選時間">
-        <button type="button" class="pill" id="ago-0" data-ago="0">現在</button>
-        <button type="button" class="pill" id="ago-15" data-ago="15">15 分前</button>
-        <button type="button" class="pill" id="ago-30" data-ago="30">30 分前</button>
-        <button type="button" class="pill" id="ago-60" data-ago="60">1 小時前</button>
+      <span class="label" id="f-time-lab">時間</span>
+      <div class="time-step" id="time-step">
+        <button type="button" class="step" id="t-m30" data-dt="-30" aria-label="提早 30 分鐘">−30</button>
+        <button type="button" class="step" id="t-m5" data-dt="-5" aria-label="提早 5 分鐘">−5</button>
+        <label class="time-field"><b id="f-time-show">--:--</b><input type="time" id="f-time" aria-label="時間"></label>
+        <button type="button" class="step" id="t-p5" data-dt="5" aria-label="延後 5 分鐘">+5</button>
+        <button type="button" class="step" id="t-p30" data-dt="30" aria-label="延後 30 分鐘">+30</button>
       </div>
+      <div data-for="sleep-range">
+        <span class="label">起床時間</span>
+        <div class="time-step" id="end-step">
+          <button type="button" class="step" id="e-m30" data-dt="-30" aria-label="起床提早 30 分鐘">−30</button>
+          <button type="button" class="step" id="e-m5" data-dt="-5" aria-label="起床提早 5 分鐘">−5</button>
+          <label class="time-field"><b id="f-end-show">--:--</b><input type="time" id="f-end" aria-label="起床時間"></label>
+          <button type="button" class="step" id="e-p5" data-dt="5" aria-label="起床延後 5 分鐘">+5</button>
+          <button type="button" class="step" id="e-p30" data-dt="30" aria-label="起床延後 30 分鐘">+30</button>
+        </div>
+      </div>
+      <div class="pills"><button type="button" class="pill" id="ago-0">🕒 設為現在</button></div>
+    </div>
+
+    <div class="card nearby" id="nearby">
+      <span class="label" id="nearby-title">這個時間前後的紀錄</span>
+      <ul id="nearby-list"></ul>
+      <div class="dup" id="dup-warn" role="status"></div>
     </div>
 
     <div class="card" data-for="feed">
@@ -2091,25 +2301,18 @@ body.form-mode .grip { display: none; }
 
     <div class="preview-line" id="f-preview"></div>
     <div class="err" id="f-err" role="alert"></div>
-    <p class="note" id="f-note">會寫進試算表，跟在 LINE 打字記錄一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
+    <p class="note" id="f-note">儲存後會出現在「時間軸」，記錯了可以在那裡刪除。</p>
     <div class="savebar"><button class="btn primary" type="submit" id="f-submit">儲存紀錄</button></div>
 
-    <div class="done" id="done" hidden>
-      <div class="done-check" aria-hidden="true">✓</div>
-      <div class="done-msg" id="done-msg"></div>
-      <div class="done-actions">
-        <button class="btn" type="button" id="done-again">再記一筆</button>
-        <button class="btn" type="button" id="done-report">看報表</button>
-        <button class="btn primary" type="button" id="done-close">完成</button>
-      </div>
-    </div>
   </form>
 </div>
+
 
 <script>
 var KEY = __KEY__;
 var MODE = __MODE__;
 var LIFF_ID = __LIFF__;
+var VIEW = __VIEW__;
 var DATA = __DATA__;
 (function () {
   var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, OFF = 8 * HOUR;
@@ -2162,126 +2365,411 @@ var DATA = __DATA__;
   document.addEventListener('pointerdown', function (e) { var m = tipTarget(e); if (m) showTip(e, m.getAttribute('data-tip')); else tip.hidden = true; });
   addEventListener('scroll', function () { tip.hidden = true; }, { passive: true });
 
-  // ---------- 標題與摘要 ----------
-  function drawHeader() {
-    var b = DATA.baby || {}, parts = ['👶 ' + (b.name || '寶寶')];
-    if (b.birth) {
-      var days = Math.floor((DATA.today - dayOf(b.birth)) / DAY) + 1;
-      parts.push('出生第 ' + days + ' 天（' + Math.floor((days - 1) / 30.44) + ' 個月）');
+  // ---------- 紀錄的顯示方式 ----------
+  var KIND_INFO = {
+    feed: ['🍼', 'c-feed'], sleep: ['🌙', 'c-sleep'], diaper: ['🧷', 'c-diaper'], temp: ['🌡️', 'c-temp'], growth: ['⚖️', 'c-growth'],
+    med: ['💊', 'c-other'], bath: ['🛁', 'c-other'], pump: ['🥛', 'c-other'], vaccine: ['💉', 'c-other'], clinic: ['🏥', 'c-other'], note: ['📝', 'c-other']
+  };
+  var FEED_NAMES = { '配方奶': '配方奶', '瓶餵母乳': '母乳瓶餵', '瓶餵': '瓶餵', '母乳': '親餵', '喝奶': '喝奶', '副食品': '副食品' };
+  function num(v) { return Math.round(v * 100) / 100; }
+  function val(r) { return r.v == null ? '' : num(r.v) + (r.u || ''); }
+  function nowMs() { return DATA.now + (Date.now() - LOADED); }
+  var LOADED = Date.now();
+  function words(d) { return String(d || '').split(' ').filter(Boolean); }
+  function diaperKind(r) { var w = words(r.d)[0] || ''; return { pee: w.indexOf('尿') >= 0, poo: w.indexOf('便') >= 0 }; }
+
+  /** 一筆紀錄 → { title, sub, time } */
+  function describeRec(r) {
+    var w = words(r.d), t = hm(r.s);
+    switch (r.k) {
+      case 'feed': {
+        var name = FEED_NAMES[w[0]] || w[0] || '餵食', rest = w.slice(1);
+        if (w[0] === '母乳' && /^(左|右|左右)$/.test(rest[0] || '')) { name += { '左': '左側', '右': '右側', '左右': '雙側' }[rest[0]]; rest = rest.slice(1); }
+        return { title: name + (r.v != null ? ' ' + val(r) : ''), sub: rest.join('、'), time: t };
+      }
+      case 'sleep': {
+        var end = r.e || nowMs(), ongoing = !r.e;
+        return { title: ongoing ? '睡眠中' : '睡眠 ' + dur(end - r.s), sub: ongoing ? '已睡 ' + dur(end - r.s) : '', time: t, time2: ongoing ? '現在' : hm(r.e) };
+      }
+      case 'diaper': {
+        var dk = diaperKind(r);
+        return { title: dk.pee && dk.poo ? '尿尿＋大便' : dk.poo ? '大便' : '尿尿', sub: w.slice(1).join('、'), time: t };
+      }
+      case 'temp': return { title: '體溫 ' + val(r), sub: (r.v >= 38 ? '⚠️ 發燒' : r.v >= 37.5 ? '偏高' : '') + (r.d ? (r.v >= 37.5 ? '・' : '') + r.d : ''), time: t };
+      case 'growth': return { title: r.d + ' ' + val(r), sub: '', time: t };
+      case 'med': return { title: '吃藥 ' + r.d + (r.v != null ? ' ' + val(r) : ''), sub: '', time: t };
+      case 'bath': return { title: '洗澡', sub: r.d, time: t };
+      case 'pump': return { title: '擠奶' + (r.v != null ? ' ' + val(r) : ''), sub: r.d, time: t };
+      case 'vaccine': return { title: '疫苗', sub: r.d, time: t };
+      case 'clinic': return { title: '看診', sub: r.d, time: t };
+      case 'note': return { title: '備註', sub: r.d, time: t };
+      default: return { title: r.d || r.k, sub: '', time: t };
     }
-    $('baby-line').textContent = parts.join(' · ');
-    var p = tw(DATA.now);
-    $('asof').textContent = '更新於 ' + (p.mo + 1) + '/' + p.d + '（' + WD[p.wd] + '）' + hm(DATA.now) + ' · 今日統計到目前為止';
+  }
+  function matchesFilter(r, f) {
+    if (f === 'all') return true;
+    if (f === 'other') return ['feed', 'sleep', 'diaper'].indexOf(r.k) < 0;
+    return r.k === f;
   }
 
-  function drawTiles() {
-    var days = DATA.days, today = days[days.length - 1], yday = days[days.length - 2];
-    var html = '';
-    html += '<div class="tile feed"><span class="k">🍼 今日奶量</span>' +
-      '<span class="v">' + today.ml + '<small>ml</small></span><span class="d">' + today.n + ' 餐' + (today.breast ? ' · 親餵 ' + today.breast + ' 分' : '') + ' · 昨天 ' + yday.ml + 'ml</span></div>';
-    html += '<div class="tile sleep"><span class="k">🌙 今日睡眠</span>' +
-      '<span class="v">' + today.sleepH.toFixed(1) + '<small>小時</small></span><span class="d">' + (DATA.sleeping ? '現在正在睡 😴' : '現在醒著') + ' · 昨天 ' + yday.sleepH.toFixed(1) + 'h</span></div>';
-    html += '<div class="tile diaper"><span class="k">🧷 尿布</span>' +
-      '<span class="v">' + today.pee + '<small>尿</small> ' + today.poo + '<small>便</small></span><span class="d">' +
-      (DATA.lastDiaper ? '上次 ' + dayLabel(dayOf(DATA.lastDiaper.t)) + ' ' + hm(DATA.lastDiaper.t) : '還沒有紀錄') + '</span></div>';
-    var t = DATA.lastTemp;
-    html += '<div class="tile temp"><span class="k">🌡️ 體溫</span>' + (t
-      ? '<span class="v">' + t.v.toFixed(1) + '<small>°C</small></span><span class="d">' + dayLabel(dayOf(t.t)) + ' ' + hm(t.t) + ' · ' + (t.v >= 38 ? '發燒' : t.v >= 37.5 ? '偏高' : '正常') + '</span>'
-      : '<span class="v">–</span><span class="d">還沒有紀錄</span>') + '</div>';
-    var f = DATA.lastFeed, pr = DATA.prediction;
-    html += '<div class="tile wide"><div><span class="k">🔮 預計下一餐</span><span class="v">' + (pr ? '約 ' + hm(pr.at) : '–') + '</span></div>' +
-      '<span class="d">' + (f ? '上一餐 ' + dayLabel(dayOf(f.t)) + ' ' + hm(f.t) + ' ' + esc(f.label) : '還沒有餵奶紀錄') +
-      (pr && pr.amount ? '<br>建議準備約 ' + pr.amount + 'ml' : pr ? '' : '<br>多記幾餐（約 1～2 天）就會開始預測') + '</span></div>';
-    $('tiles').innerHTML = html;
+  // ---------- 一天的統計 ----------
+  function dayStats(d0) {
+    var d1 = d0 + DAY, now = nowMs(), st = { ml: 0, feeds: 0, breast: 0, gap: null, lastFeed: null, sleepMs: 0, sleeps: 0, longest: 0, pee: 0, poo: 0, maxTemp: null };
+    var feedTimes = [];
+    DATA.records.forEach(function (r) {
+      if (r.k === 'sleep') {
+        var e = r.e || now, a = Math.max(r.s, d0), b = Math.min(e, d1);
+        if (b > a) { st.sleepMs += b - a; st.longest = Math.max(st.longest, e - r.s); }
+        if (r.s >= d0 && r.s < d1) st.sleeps++;
+        return;
+      }
+      if (r.s < d0 || r.s >= d1) return;
+      if (r.k === 'feed') {
+        st.feeds++; feedTimes.push(r.s); st.lastFeed = r;
+        if (r.u === 'ml') st.ml += r.v || 0;
+        if (r.u === '分鐘') st.breast += r.v || 0;
+      } else if (r.k === 'diaper') {
+        var dk = diaperKind(r); if (dk.pee) st.pee++; if (dk.poo) st.poo++;
+      } else if (r.k === 'temp' && r.v != null) st.maxTemp = st.maxTemp == null ? r.v : Math.max(st.maxTemp, r.v);
+    });
+    feedTimes.sort(function (a, b) { return a - b; });
+    if (feedTimes.length > 1) st.gap = (feedTimes[feedTimes.length - 1] - feedTimes[0]) / (feedTimes.length - 1);
+    return st;
+  }
+  function tilesHtml(d0, compact) {
+    var st = dayStats(d0), isToday = d0 === DATA.today;
+    function tile(cls, filter, k, v, d) { return '<button type="button" class="tile ' + cls + '" data-filter="' + filter + '" data-day="' + d0 + '"><span class="k">' + k + '</span><span class="v">' + v + '</span><span class="d">' + d + '</span></button>'; }
+    return tile('feed', 'feed', '🍼 喝奶', st.ml + '<small>ml</small>', st.feeds + ' 餐' + (st.breast ? ' · 親餵 ' + st.breast + ' 分' : '') +
+        (st.gap ? ' · 間隔約 ' + dur(st.gap) : '') + (isToday && st.lastFeed ? '<br>上一餐 ' + hm(st.lastFeed.s) : '')) +
+      tile('sleep', 'sleep', '🌙 睡眠', (st.sleepMs / HOUR).toFixed(1) + '<small>小時</small>', st.sleeps + ' 段' + (st.longest ? ' · 最長 ' + dur(st.longest) : '') +
+        (isToday ? '<br>' + (DATA.sleepingSince ? '現在正在睡 😴' : '現在醒著') : '')) +
+      tile('diaper', 'diaper', '🧷 尿布', st.pee + '<small>尿</small> ' + st.poo + '<small>便</small>', '共 ' + (st.pee + st.poo) + ' 次') +
+      tile('temp', 'other', '🌡️ 體溫', st.maxTemp == null ? '–' : st.maxTemp.toFixed(1) + '<small>°C</small>',
+        st.maxTemp == null ? '這天沒有量' : st.maxTemp >= 38 ? '⚠️ 最高 ' + st.maxTemp + '，發燒' : st.maxTemp >= 37.5 ? '最高偏高' : '正常範圍');
+  }
+  function bindTiles(host) {
+    Array.prototype.forEach.call(host.querySelectorAll('.tile[data-filter]'), function (t) {
+      t.addEventListener('click', function () { setFilter(t.getAttribute('data-filter')); showDay(Number(t.getAttribute('data-day'))); go('day'); });
+    });
   }
 
-  // ---------- 可能漏記 ----------
-  function limitFor(t) { return (isNight(t) ? 6.5 : 4.5) * HOUR; }
+  // ---------- 可能漏記：餵奶間隔特別長 ----------
   function findGaps() {
-    var out = [], from = DATA.today - 6 * DAY, f = DATA.feeds;
+    var out = [], f = DATA.records.filter(function (r) { return r.k === 'feed'; }).sort(function (a, b) { return a.s - b.s; });
+    var from = DATA.today - 6 * DAY;
+    function limit(t) { return (isNight(t) ? 6.5 : 4.5) * HOUR; }
     for (var i = 1; i < f.length; i++) {
-      if (f[i].t < from) continue;
-      if (f[i].t - f[i - 1].t > limitFor(f[i - 1].t)) out.push({ a: f[i - 1].t, b: f[i].t });
+      if (f[i].s < from) continue;
+      if (f[i].s - f[i - 1].s > limit(f[i - 1].s)) out.push({ a: f[i - 1].s, b: f[i].s });
     }
-    if (f.length) {
-      var last = f[f.length - 1].t;
-      if (DATA.now - last > limitFor(last)) out.push({ a: last, b: DATA.now, open: true });
-    }
+    if (f.length) { var last = f[f.length - 1].s; if (nowMs() - last > limit(last)) out.push({ a: last, b: nowMs(), open: true }); }
     return out;
   }
   function gapMid(g) { return round5(g.a + (g.b - g.a) / 2); }
-  function drawGaps() {
-    var gs = findGaps(), host = $('gaps');
-    $('gaps-panel').hidden = !gs.length;
-    host.innerHTML = '';
-    gs.forEach(function (g) {
-      var row = document.createElement('div'); row.className = 'gap-row';
-      row.innerHTML = '<span><b>' + dayLabel(dayOf(g.a)) + ' ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + '</b> · ' + dur(g.b - g.a) + '沒有餵奶紀錄</span>';
-      var b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = '補登';
+
+  // ---------- 列表項目 ----------
+  var NEW_IDS = {};
+  function itemEl(r, opts) {
+    opts = opts || {};
+    var info = KIND_INFO[r.k] || ['•', 'c-other'], de = describeRec(r);
+    var wrap = document.createElement('div');
+    wrap.className = 'item' + (NEW_IDS[r.id] ? ' new' : '');
+    var timeHtml = de.time2 ? de.time + '<small>– ' + de.time2 + '</small>' : de.time;
+    if (opts.showDay && dayOf(r.s) !== DATA.today) timeHtml = '<small>' + dayLabel(dayOf(r.s)) + '</small>' + timeHtml;
+    else if (opts.day && r.s < opts.day) timeHtml = '<small>前一天</small>' + timeHtml;
+    var by = r.by ? (r.by === '網頁補登' ? '網頁' : r.by) : '';
+    var sub = [de.sub, by].filter(Boolean).join(' · ');
+    wrap.innerHTML = '<div class="item-main"><div class="it-time">' + timeHtml + '</div><div class="it-dot ' + info[1] + '" aria-hidden="true">' + info[0] + '</div>' +
+      '<div><div class="it-title">' + esc(de.title) + (NEW_IDS[r.id] ? '<span class="new-badge">剛新增</span>' : '') + '</div>' + (sub ? '<div class="it-sub">' + esc(sub) + '</div>' : '') + '</div>' +
+      '<button class="it-more" type="button" aria-label="更多動作" aria-expanded="false">⋯</button></div>';
+    var more = wrap.querySelector('.it-more');
+    more.addEventListener('click', function () {
+      var open = wrap.querySelector('.item-actions');
+      if (open) { open.remove(); more.setAttribute('aria-expanded', 'false'); return; }
+      more.setAttribute('aria-expanded', 'true');
+      var act = document.createElement('div'); act.className = 'item-actions';
+      var again = document.createElement('button'); again.type = 'button'; again.className = 'btn'; again.textContent = '＋ 從這個時間再記一筆';
+      again.addEventListener('click', function () { openForm({ at: r.s, kind: ['feed', 'diaper', 'temp'].indexOf(r.k) >= 0 ? r.k : r.k === 'growth' ? 'weight' : undefined }); });
+      var del = document.createElement('button'); del.type = 'button'; del.className = 'btn danger'; del.textContent = '🗑 刪除';
+      del.addEventListener('click', function () {
+        act.innerHTML = '<div class="confirm">確定要刪除「' + esc(de.time + ' ' + de.title) + '」嗎？</div>';
+        var no = document.createElement('button'); no.type = 'button'; no.className = 'btn'; no.textContent = '取消';
+        no.addEventListener('click', function () { act.remove(); more.setAttribute('aria-expanded', 'false'); });
+        var yes = document.createElement('button'); yes.type = 'button'; yes.className = 'btn danger'; yes.textContent = '刪除';
+        yes.addEventListener('click', function () { removeRecord(r.id, yes); });
+        act.appendChild(no); act.appendChild(yes); no.focus();
+      });
+      act.appendChild(again); act.appendChild(del);
+      wrap.appendChild(act);
+    });
+    return wrap;
+  }
+  function emptyCard(icon, msg) { var d = document.createElement('div'); d.className = 'empty-card'; d.innerHTML = '<div class="ic">' + icon + '</div><div>' + msg + '</div>'; return d; }
+
+  // ---------- 呼叫後端 ----------
+  function run(fn, arg, ok, fail) {
+    if (typeof google === 'undefined' || !google.script || !google.script.run) { fail('請從 LINE 裡的連結打開這個頁面，才能儲存。'); return; }
+    google.script.run
+      .withSuccessHandler(function (res) { if (!res || !res.ok) { fail((res && res.message) || '儲存失敗，請再試一次。'); return; } ok(res); })
+      .withFailureHandler(function (err) { fail('連線失敗：' + (err && err.message ? err.message : err)); })[fn](KEY, arg);
+  }
+  function applyData(res) {
+    var before = {};
+    DATA.records.concat(DATA.diary).forEach(function (r) { before[r.id] = true; });
+    DATA = res.data; LOADED = Date.now();
+    var added = DATA.records.concat(DATA.diary).filter(function (r) { return !before[r.id]; });
+    NEW_IDS = {}; added.forEach(function (r) { NEW_IDS[r.id] = true; });
+    return added;
+  }
+  function removeRecord(id, btn) {
+    btn.disabled = true; btn.textContent = '刪除中…';
+    run('webDeleteRecord', id, function (res) { applyData(res); renderAll(); toast(res.message); }, function (msg) { btn.disabled = false; btn.textContent = '刪除'; toast('⚠️ ' + msg); });
+  }
+
+  // ---------- 分頁 ----------
+  var current = 'today';
+  function go(view) {
+    current = view;
+    ['today', 'day', 'diary', 'trend'].forEach(function (v) { $('v-' + v).hidden = v !== view; });
+    Array.prototype.forEach.call(document.querySelectorAll('.tab[data-view]'), function (t) {
+      if (t.getAttribute('data-view') === view) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+    });
+    if (view === 'trend') { drawTrends(); drawGrowth(); }
+    if (view === 'day') renderDay();
+    scrollTo(0, 0);
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('.tab[data-view]'), function (t) {
+    t.addEventListener('click', function () { go(t.getAttribute('data-view')); });
+  });
+
+  // ---------- 今天 ----------
+  function babyAge() {
+    var b = DATA.baby || {};
+    if (!b.birth) return '';
+    var days = Math.floor((DATA.today - dayOf(b.birth)) / DAY);
+    var bp = tw(b.birth), tp = tw(DATA.today), months = (tp.y - bp.y) * 12 + tp.mo - bp.mo;
+    if (tp.d < bp.d) months--;
+    var anchor = Date.UTC(bp.y, bp.mo + months, bp.d) - OFF, rest = Math.round((DATA.today - anchor) / DAY);
+    return (months > 0 ? months + ' 個月 ' : '') + rest + ' 天（出生第 ' + (days + 1) + ' 天）';
+  }
+  function renderToday() {
+    var b = DATA.baby || {};
+    $('baby-name').textContent = b.name || '寶寶';
+    $('baby-age').textContent = b.birth ? babyAge() + ' · ' + tw(b.birth).y + '/' + md(b.birth) + ' 出生' : '在 LINE 輸入「設定 生日 2026/8/5」就會顯示年齡';
+    var pr = DATA.prediction, lf = DATA.lastFeed, hero = '';
+    if (DATA.sleepingSince) {
+      hero += '<div class="row"><div><div class="muted">😴 ' + hm(DATA.sleepingSince) + ' 入睡</div><div class="big-t">已睡 ' + dur(nowMs() - DATA.sleepingSince) + '</div></div></div>';
+    } else {
+      var lastSleep = DATA.records.filter(function (r) { return r.k === 'sleep' && r.e; }).sort(function (a, b) { return b.e - a.e; })[0];
+      hero += '<div class="row"><div><div class="muted">☀️ 醒著' + (lastSleep ? '（' + hm(lastSleep.e) + ' 起床）' : '') + '</div>' +
+        (lastSleep ? '<div class="big-t">已醒 ' + dur(nowMs() - lastSleep.e) + '</div>' : '') + '</div></div>';
+    }
+    hero += '<div class="row"><div class="muted">🔮 下一餐 ' + (pr ? '<b>約 ' + hm(pr.at) + '</b>' + (pr.amount ? '，約 ' + pr.amount + 'ml' : '') : '多記幾餐就會開始預測') + '</div>' +
+      (lf ? '<div class="muted">上一餐 ' + hm(lf.t) + '（' + dur(nowMs() - lf.t) + '前）</div>' : '') + '</div>';
+    $('hero').innerHTML = hero;
+    $('qa-feed-sub').textContent = lf ? '上一餐 ' + lf.label : '';
+    var ld = DATA.lastDiaper;
+    $('qa-diaper-sub').textContent = ld ? '上次 ' + hm(ld.t) : '';
+    $('qa-sleep-ic').textContent = DATA.sleepingSince ? '☀️' : '🌙';
+    $('qa-sleep-txt').innerHTML = DATA.sleepingSince ? '醒來了<small>一鍵記錄起床</small>' : '開始睡覺<small>一鍵開始計時</small>';
+    $('today-tiles').innerHTML = tilesHtml(DATA.today); bindTiles($('today-tiles'));
+    var gs = findGaps().filter(function (g) { return !g.open; }), gb = $('gap-banner');
+    gb.hidden = !gs.length;
+    if (gs.length) {
+      var g = gs[gs.length - 1];
+      gb.innerHTML = '<span>⚠️ 最近 7 天有 <b>' + gs.length + '</b> 段時間沒有餵奶紀錄，可能漏記了</span><span>去補 ›</span>';
+      gb.onclick = function () { setFilter('all'); showDay(dayOf(g.a)); go('day'); };
+    }
+    var recent = $('recent'); recent.innerHTML = '';
+    var list = DATA.records.slice().sort(function (a, b) { return b.s - a.s || b.id - a.id; }).slice(0, 5);
+    if (!list.length) recent.appendChild(emptyCard('🍼', '還沒有紀錄，按下面的「＋」開始記錄吧'));
+    list.forEach(function (r) { recent.appendChild(itemEl(r, { showDay: true })); });
+  }
+  $('qa-feed').addEventListener('click', function () { openForm({ kind: 'feed' }); });
+  $('qa-diaper').addEventListener('click', function () { openForm({ kind: 'diaper' }); });
+  $('qa-diary').addEventListener('click', function () { go('diary'); $('dy-text').focus(); });
+  $('today-more').addEventListener('click', function () { showDay(DATA.today); go('day'); });
+  $('avatar').addEventListener('click', function () {
+    toast('在 LINE 輸入以下指令設定寶寶資料：\n設定 名字 小寶\n設定 生日 2026/8/5\n設定 性別 男（或 女）');
+  });
+  $('qa-sleep').addEventListener('click', function () {
+    var btn = $('qa-sleep'); if (btn.disabled) return;
+    btn.disabled = true;
+    var cmd = DATA.sleepingSince ? '起床' : '睡覺';
+    run('webAddRecord', { text: cmd }, function (res) { btn.disabled = false; applyData(res); renderAll(); toast(res.message); },
+      function (msg) { btn.disabled = false; toast('⚠️ ' + msg); });
+  });
+
+  // ---------- 時間軸（單日） ----------
+  var curDay = DATA.today, filter = 'all';
+  try { filter = localStorage.getItem('bb-filter') || 'all'; } catch (e) {}
+  function setFilter(f) {
+    filter = f;
+    Array.prototype.forEach.call(document.querySelectorAll('#filters [data-v]'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-v') === f)); });
+    try { localStorage.setItem('bb-filter', f); } catch (e) {}
+  }
+  setFilter(filter);
+  Array.prototype.forEach.call(document.querySelectorAll('#filters [data-v]'), function (b) {
+    b.addEventListener('click', function () { setFilter(b.getAttribute('data-v')); renderDay(); });
+  });
+  var FIRST_DAY = DATA.today - 30 * DAY;
+  (function () {
+    var sel = $('day-select');
+    for (var i = 0; i <= 30; i++) { var d0 = DATA.today - i * DAY, o = document.createElement('option'); o.value = String(d0); o.textContent = md(d0) + '（' + WD[tw(d0).wd] + '）' + (i === 0 ? ' 今天' : i === 1 ? ' 昨天' : ''); sel.appendChild(o); }
+    sel.addEventListener('change', function () { showDay(Number(sel.value)); });
+  })();
+  function showDay(d0) { curDay = Math.max(FIRST_DAY, Math.min(DATA.today, d0)); if (current === 'day') renderDay(); }
+  $('day-prev').addEventListener('click', function () { showDay(curDay - DAY); });
+  $('day-next').addEventListener('click', function () { showDay(curDay + DAY); });
+  $('day-add').addEventListener('click', function () { openForm({ at: curDay === DATA.today ? nowMs() : curDay + 12 * HOUR }); });
+
+  function renderDay() {
+    var p = tw(curDay);
+    $('day-title').textContent = (p.mo + 1) + ' 月 ' + p.d + ' 日（' + WD[p.wd] + '）';
+    $('day-sub').textContent = (curDay === DATA.today ? '今天' : curDay === DATA.today - DAY ? '昨天' : Math.round((DATA.today - curDay) / DAY) + ' 天前') + ' · 點這裡選日期';
+    $('day-select').value = String(curDay);
+    $('day-prev').disabled = curDay <= FIRST_DAY;
+    $('day-next').disabled = curDay >= DATA.today;
+    $('day-tiles').innerHTML = tilesHtml(curDay); bindTiles($('day-tiles'));
+    drawRibbon();
+    var host = $('day-list'); host.innerHTML = '';
+    var d1 = curDay + DAY;
+    var recs = DATA.records.filter(function (r) {
+      if (r.k === 'sleep') return r.s < d1 && (r.e || nowMs()) > curDay;
+      return r.s >= curDay && r.s < d1;
+    }).filter(function (r) { return matchesFilter(r, filter); }).sort(function (a, b) { return a.s - b.s || a.id - b.id; });
+    var rows = recs.map(function (r) { return { t: Math.max(r.s, curDay), r: r }; });
+    if (filter === 'all' || filter === 'feed') {
+      findGaps().forEach(function (g) { if (g.b > curDay && g.a < d1) rows.push({ t: Math.max(g.a, curDay) + 1, gap: g }); });
+    }
+    rows.sort(function (a, b) { return a.t - b.t; });
+    if (!rows.length) host.appendChild(emptyCard('🗓️', filter === 'all' ? '這天還沒有紀錄' : '這天沒有符合篩選的紀錄'));
+    rows.forEach(function (row) {
+      if (row.r) { host.appendChild(itemEl(row.r, { day: curDay })); return; }
+      var g = row.gap, div = document.createElement('div'); div.className = 'gap';
+      div.innerHTML = '<span>⚠️ ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + '<br>有 ' + dur(g.b - g.a) + '沒有餵奶紀錄</span>';
+      var b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = '＋ 補上';
       b.addEventListener('click', function () { openForm({ at: gapMid(g), kind: 'feed' }); });
-      row.appendChild(b); host.appendChild(row);
+      div.appendChild(b); host.appendChild(div);
+    });
+    $('day-add').textContent = '＋ 在 ' + md(curDay) + ' 新增一筆';
+  }
+
+  // 單日 24 小時色帶：睡眠是藍色長條、餵奶是圓點、尿布是下方的短線
+  function drawRibbon() {
+    var host = $('ribbon'); host.innerHTML = '';
+    var W = host.clientWidth || 330, H = 64, T = 6, BH = 22, PW = W - 2, d0 = curDay, d1 = d0 + DAY;
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img', 'aria-label': '這天的 24 小時作息' }, host);
+    function x(t) { return 1 + ((t - d0) / DAY) * PW; }
+    el('rect', { x: 1, y: T, width: PW, height: BH, rx: 8, fill: 'var(--page)' }, svg);
+    el('rect', { x: 1, y: T, width: x(d0 + 6 * HOUR) - 1, height: BH, rx: 8, fill: 'var(--night)' }, svg);
+    el('rect', { x: x(d0 + 22 * HOUR), y: T, width: PW - x(d0 + 22 * HOUR) + 1, height: BH, rx: 8, fill: 'var(--night)' }, svg);
+    DATA.records.forEach(function (r) {
+      if (r.k === 'sleep') {
+        var a = Math.max(r.s, d0), b = Math.min(r.e || nowMs(), d1);
+        if (b <= a) return;
+        el('rect', { x: x(a), y: T + 3, width: Math.max(2, x(b) - x(a) - 1), height: BH - 6, rx: 4, fill: 'var(--sleep)',
+          'data-tip': '🌙 ' + hm(r.s) + '–' + (r.e ? hm(r.e) : '現在') + '\n睡了 ' + dur((r.e || nowMs()) - r.s) }, svg);
+      }
+    });
+    findGaps().forEach(function (g) {
+      var a = Math.max(g.a, d0), b = Math.min(g.b, d1);
+      if (b - a < 30 * MIN) return;
+      el('rect', { x: x(a), y: T + 1, width: x(b) - x(a), height: BH - 2, rx: 6, fill: 'var(--warn-bg)', stroke: 'var(--warn)', 'stroke-dasharray': '3 2',
+        'data-tip': '⚠️ ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + ' 沒有餵奶紀錄' }, svg);
+    });
+    DATA.records.forEach(function (r) {
+      if (r.s < d0 || r.s >= d1) return;
+      if (r.k === 'feed') el('circle', { cx: x(r.s), cy: T + BH / 2, r: 5, fill: 'var(--feed)', stroke: 'var(--surface)', 'stroke-width': 2, 'data-tip': '🍼 ' + hm(r.s) + ' ' + describeRec(r).title }, svg);
+      if (r.k === 'diaper') {
+        var dk = diaperKind(r);
+        el('rect', { x: x(r.s) - 1.5, y: T + BH + 3, width: 3, height: 8, rx: 1, fill: dk.poo ? 'var(--poo)' : 'var(--pee)', 'data-tip': '🧷 ' + hm(r.s) + ' ' + describeRec(r).title }, svg);
+      }
+    });
+    if (d0 === DATA.today) { var nx = x(nowMs()); el('line', { x1: nx, x2: nx, y1: T - 3, y2: T + BH + 3, stroke: 'var(--ink)', 'stroke-width': 1.5 }, svg); }
+    [0, 6, 12, 18, 24].forEach(function (h) {
+      text(svg, x(d0 + h * HOUR), H - 4, h === 24 ? '24' : pad(h) + ':00', { 'text-anchor': h === 0 ? 'start' : h === 24 ? 'end' : 'middle' });
     });
   }
 
-  // ---------- 24 小時作息圖 ----------
-  function drawRhythm() {
-    var host = $('rhythm'); host.innerHTML = '';
-    var W = host.clientWidth || 340, L = 46, R = 6, T = 4, rowH = 30, rows = 7;
-    var H = T + rows * rowH + 18, PW = W - L - R;
-    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img', 'aria-label': '最近 7 天的 24 小時作息圖' }, host);
-    function x(h) { return L + (h / 24) * PW; }
-    var gaps = findGaps();
-    for (var r = 0; r < rows; r++) (function (r) {
-      var d0 = DATA.today - r * DAY, y = T + r * rowH, cy = y + rowH / 2;
-      function toH(t) { return (t - d0) / HOUR; }
-      el('rect', { x: x(0), y: y + 2, width: x(6) - x(0), height: rowH - 4, fill: 'var(--night)', rx: 3 }, svg);
-      el('rect', { x: x(22), y: y + 2, width: x(24) - x(22), height: rowH - 4, fill: 'var(--night)', rx: 3 }, svg);
-      el('line', { x1: L, x2: L + PW, y1: cy, y2: cy, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
-      text(svg, L - 6, cy + 4, dayLabel(d0), { 'text-anchor': 'end', 'class': 'rowlab' });
-      var bg = el('rect', { x: L, y: y, width: PW, height: rowH, fill: 'transparent', style: 'cursor:copy' }, svg);
-      bg.addEventListener('click', function (ev) {
-        var box = svg.getBoundingClientRect(), h = ((ev.clientX - box.left) * (W / box.width) - L) / PW * 24;
-        var at = d0 + Math.round(Math.max(0, Math.min(23.9, h)) * 12) * 5 * MIN;
-        openForm({ at: Math.min(at, round5(DATA.now)) });
-      });
-      gaps.forEach(function (g) {
-        var a = Math.max(g.a, d0), b = Math.min(g.b, d0 + DAY);
-        if (b <= a) return;
-        var gr = el('rect', { x: x(toH(a)) + 6, y: y + 3, width: Math.max(4, x(toH(b)) - x(toH(a)) - 12), height: rowH - 6, rx: 4,
-          fill: 'var(--warn-bg)', stroke: 'var(--warn)', 'stroke-dasharray': '3 2', style: 'cursor:copy',
-          'data-tip': '⚠️ ' + hm(g.a) + '–' + (g.open ? '現在' : hm(g.b)) + ' 沒有餵奶紀錄（' + dur(g.b - g.a) + '）\n點一下補登' }, svg);
-        gr.addEventListener('click', function () { openForm({ at: gapMid(g), kind: 'feed' }); });
-      });
-      DATA.sleeps.forEach(function (s) {
-        var a = Math.max(s.s, d0), b = Math.min(s.e, d0 + DAY);
-        if (b <= a) return;
-        el('rect', { x: x(toH(a)), y: cy - 6, width: Math.max(1.5, x(toH(b)) - x(toH(a)) - 1), height: 12, rx: 3, fill: 'var(--sleep)',
-          stroke: s.web ? 'var(--ink)' : 'none', 'stroke-width': 1.5 }, svg);
-        el('rect', { x: x(toH(a)), y: y, width: Math.max(6, x(toH(b)) - x(toH(a))), height: rowH, fill: 'transparent',
-          'data-tip': '😴 睡眠 ' + hm(s.s) + '–' + (s.ongoing ? '現在' : hm(s.e)) + '\n共 ' + dur(s.e - s.s) + (s.ongoing ? '（還在睡）' : '') + (s.web ? '（網頁補登）' : '') }, svg);
-      });
-      DATA.diapers.forEach(function (dz) {
-        if (dz.t < d0 || dz.t >= d0 + DAY) return;
-        var px = x(toH(dz.t));
-        if (dz.kind === 'pee') el('rect', { x: px - 1.5, y: y + 1, width: 3, height: 7, rx: 1, fill: 'var(--pee)' }, svg);
-        else el('rect', { x: px - 4, y: y + rowH - 6, width: 8, height: 4, rx: 1, fill: 'var(--poo)' }, svg);
-        el('circle', { cx: px, cy: dz.kind === 'pee' ? y + 4 : y + rowH - 4, r: 8, fill: 'transparent', 'data-tip': (dz.kind === 'pee' ? '💧 尿布 尿 ' : '💩 尿布 便 ') + hm(dz.t) }, svg);
-      });
-      DATA.feeds.forEach(function (f, i) {
-        if (f.t < d0 || f.t >= d0 + DAY) return;
-        var px = x(toH(f.t)), prev = DATA.feeds[i - 1];
-        el('circle', { cx: px, cy: cy, r: f.web ? 5.5 : 4.5, fill: 'var(--feed)', stroke: f.web ? 'var(--ink)' : 'var(--surface)', 'stroke-width': 2 }, svg);
-        el('circle', { cx: px, cy: cy, r: 11, fill: 'transparent',
-          'data-tip': '🍼 ' + hm(f.t) + ' ' + f.label + (f.web ? '（網頁補登）' : '') + (prev ? '\n距離上一餐 ' + dur(f.t - prev.t) : '') }, svg);
-      });
-    })(r);
-    [0, 6, 12, 18, 24].forEach(function (h) {
-      el('line', { x1: x(h), x2: x(h), y1: T, y2: T + rows * rowH, stroke: 'var(--grid)', 'stroke-width': 1, 'stroke-dasharray': h % 24 ? '2 3' : '' }, svg);
-      text(svg, x(h), H - 4, h === 24 ? '24' : pad(h) + ':00', { 'text-anchor': h === 0 ? 'start' : h === 24 ? 'end' : 'middle' });
+  // ---------- 日記 ----------
+  var diaryMood = '';
+  function splitMood(d) {
+    var m = String(d || '').match(/^(\S{1,4})\s([\s\S]*)$/);
+    if (m && !/[一-龥A-Za-z0-9]/.test(m[1])) return { mood: m[1], text: m[2] };
+    return { mood: '', text: String(d || '') };
+  }
+  (function () {
+    var sel = $('dy-date');
+    for (var i = 0; i < 60; i++) { var d0 = DATA.today - i * DAY, o = document.createElement('option'); o.value = String(d0); o.textContent = md(d0) + '（' + WD[tw(d0).wd] + '）'; sel.appendChild(o); }
+    function pick(d0) {
+      sel.value = String(d0);
+      Array.prototype.forEach.call(document.querySelectorAll('#dy-days [data-off]'), function (b) { b.setAttribute('aria-pressed', String(DATA.today - Number(b.getAttribute('data-off')) * DAY === d0)); });
+      var off = Math.round((DATA.today - d0) / DAY);
+      $('dy-more-label').textContent = off > 1 ? md(d0) + ' ▾' : '其他日期 ▾';
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('#dy-days [data-off]'), function (b) {
+      b.addEventListener('click', function () { pick(DATA.today - Number(b.getAttribute('data-off')) * DAY); });
     });
-    var nx = x((DATA.now - DATA.today) / HOUR);
-    el('line', { x1: nx, x2: nx, y1: T, y2: T + rowH, stroke: 'var(--ink)', 'stroke-width': 1.5 }, svg);
-    text(svg, nx + 3 > L + PW - 24 ? nx - 3 : nx + 3, T + 9, '現在', { 'class': 'vlab', 'text-anchor': nx + 3 > L + PW - 24 ? 'end' : 'start' });
+    sel.addEventListener('change', function () { pick(Number(sel.value)); });
+    pick(DATA.today);
+    Array.prototype.forEach.call(document.querySelectorAll('#dy-mood [data-v]'), function (b) {
+      b.addEventListener('click', function () {
+        var on = b.getAttribute('aria-pressed') === 'true';
+        Array.prototype.forEach.call(document.querySelectorAll('#dy-mood [data-v]'), function (o) { o.setAttribute('aria-pressed', 'false'); });
+        if (!on) b.setAttribute('aria-pressed', 'true');
+        diaryMood = on ? '' : b.getAttribute('data-v');
+      });
+    });
+  })();
+  $('dy-save').addEventListener('click', function () {
+    var text = $('dy-text').value.trim(), btn = $('dy-save');
+    $('dy-err').textContent = '';
+    if (!text) { $('dy-err').textContent = '寫一點今天的小事吧'; $('dy-text').focus(); return; }
+    var d0 = Number($('dy-date').value), at = d0 === DATA.today ? nowMs() : d0 + 21 * HOUR;
+    btn.disabled = true; btn.textContent = '儲存中…';
+    run('webAddDiary', { at: at, mood: diaryMood, text: text }, function (res) {
+      btn.disabled = false; btn.textContent = '儲存日記';
+      applyData(res); $('dy-text').value = ''; diaryMood = '';
+      Array.prototype.forEach.call(document.querySelectorAll('#dy-mood [data-v]'), function (o) { o.setAttribute('aria-pressed', 'false'); });
+      renderAll(); toast(res.message);
+    }, function (msg) { btn.disabled = false; btn.textContent = '儲存日記'; $('dy-err').textContent = msg; });
+  });
+  function entryEl(r) {
+    var sm = splitMood(r.d), b = DATA.baby || {}, p = tw(r.s), div = document.createElement('div');
+    div.className = 'entry' + (NEW_IDS[r.id] ? ' item new' : '');
+    var age = b.birth ? '出生第 ' + (Math.floor((dayOf(r.s) - dayOf(b.birth)) / DAY) + 1) + ' 天' : '';
+    div.innerHTML = '<div class="top"><div><div class="date">' + (p.mo + 1) + ' 月 ' + p.d + ' 日（' + WD[p.wd] + '）</div><div class="age">' + [age, r.by === '網頁補登' ? '' : r.by].filter(Boolean).join(' · ') + '</div></div>' +
+      (sm.mood ? '<div class="mood" aria-hidden="true">' + esc(sm.mood) + '</div>' : '') + '</div><div class="body">' + esc(sm.text) + '</div>';
+    var more = document.createElement('button'); more.type = 'button'; more.className = 'link'; more.textContent = '刪除';
+    more.style.alignSelf = 'flex-end';
+    more.addEventListener('click', function () {
+      if (more.getAttribute('data-confirm')) { removeRecord(r.id, more); return; }
+      more.setAttribute('data-confirm', '1'); more.textContent = '再按一次確定刪除';
+      setTimeout(function () { more.removeAttribute('data-confirm'); more.textContent = '刪除'; }, 4000);
+    });
+    div.appendChild(more);
+    return div;
+  }
+  function renderDiary() {
+    var host = $('diary-list'); host.innerHTML = '';
+    var list = DATA.diary.slice().sort(function (a, b) { return b.s - a.s; });
+    // 回憶：一週前、一個月前的今天
+    var mem = $('memories'); mem.innerHTML = '';
+    [[7, '一週前的今天'], [30, '一個月前的今天']].forEach(function (x) {
+      var d0 = DATA.today - x[0] * DAY, hit = list.filter(function (r) { return dayOf(r.s) === d0; })[0];
+      if (!hit) return;
+      var sm = splitMood(hit.d), c = document.createElement('div'); c.className = 'memory';
+      c.innerHTML = '<b>💭 ' + x[1] + '</b><div class="body">' + esc((sm.mood ? sm.mood + ' ' : '') + sm.text) + '</div>';
+      mem.appendChild(c);
+    });
+    if (!list.length) { host.appendChild(emptyCard('📖', '還沒有日記。寫下第一次笑、第一次翻身這些小事，以後回頭看會很珍貴。')); return; }
+    var lastMonth = '';
+    list.forEach(function (r) {
+      var p = tw(r.s), m = p.y + ' 年 ' + (p.mo + 1) + ' 月';
+      if (m !== lastMonth) { lastMonth = m; var h = document.createElement('div'); h.className = 'month'; h.textContent = m; host.appendChild(h); }
+      host.appendChild(entryEl(r));
+    });
   }
 
   // ---------- 每日趨勢 ----------
@@ -2470,9 +2958,7 @@ var DATA = __DATA__;
   });
 
   // ---------- 記錄表單 ----------
-  var overlay = $('overlay'), form = $('add-form'), lastFocus = null, saving = false;
-  var LOADED = Date.now();
-  function nowMs() { return DATA.now + (Date.now() - LOADED); }
+  var overlay = $('overlay'), form = $('add-form'), lastFocus = null, saving = false, fromQuickReply = false;
   var S = { kind: 'feed', feedType: '配方奶', side: '左', tags: [], sleepMode: 'timer', diaper: 'pee', color: '', texture: '',
     amounts: { ml: 120, min: 15, g: 30 }, temp: 37.0, kg: '' };
 
@@ -2556,33 +3042,53 @@ var DATA = __DATA__;
   pills('feed-type', { change: function (v) { S.feedType = v; refreshAmount(); } });
   pills('feed-side', { change: function (v) { S.side = v; } });
   pills('feed-tags', { multi: true, change: function (v) { S.tags = v; } });
-  pills('sleep-mode', { change: function (v) {
-    S.sleepMode = v;
-    // 手動補登預設「一小時前睡到現在」
-    if (v === 'range') { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); } else { setWhen(nowMs()); }
-    setKind('sleep');
-  } });
+  pills('sleep-mode', { change: function (v) { S.sleepMode = v; setKind('sleep'); } });
   pills('diaper-seg', { change: function (v) { S.diaper = v; $('poo-more').hidden = v === 'pee'; } });
   pills('poo-color', { optional: true, change: function (v) { S.color = v; } });
   pills('poo-texture', { optional: true, change: function (v) { S.texture = v; } });
-  each('#when-chips [data-ago]', function (b) {
-    b.addEventListener('click', function () { setWhen(nowMs() - Number(b.getAttribute('data-ago')) * MIN); update(); });
+  $('ago-0').addEventListener('click', function () { setWhen(nowMs()); update(); });
+  each('#day-chips [data-off]', function (b) {
+    b.addEventListener('click', function () {
+      var off = Number(b.getAttribute('data-off')), t = pickedTime() || nowMs();
+      setWhen(Math.min(nowMs(), t - (dayOf(t) - (DATA.today - off * DAY)))); update();
+    });
+  });
+  $('f-date').addEventListener('change', function () { markDay(); });
+  // −30／−5／+5／+30：直接調整時間，跨過午夜會自動換日期，不會超過現在
+  each('#time-step [data-dt]', function (b) {
+    b.addEventListener('click', function () {
+      var t = (pickedTime() || nowMs()) + Number(b.getAttribute('data-dt')) * MIN;
+      setWhen(Math.max(DATA.today - 30 * DAY, Math.min(nowMs(), t))); update();
+    });
+  });
+  each('#end-step [data-dt]', function (b) {
+    b.addEventListener('click', function () {
+      var e = $('f-end').value || hm(nowMs()), m = Number(e.slice(0, 2)) * 60 + Number(e.slice(3)) + Number(b.getAttribute('data-dt'));
+      m = (m + 1440) % 1440; $('f-end').value = pad(Math.floor(m / 60)) + ':' + pad(m % 60); update();
+    });
   });
   form.addEventListener('input', update);
   form.addEventListener('change', update);
 
   function fillDates() {
-    var sel = $('f-date'); sel.innerHTML = '';
-    for (var i = 0; i < 7; i++) {
+    var sel = $('f-date'); if (sel.options.length) return;
+    for (var i = 0; i <= 30; i++) {
       var d0 = DATA.today - i * DAY, o = document.createElement('option');
-      o.value = String(d0); o.textContent = dayLabel(d0) + '（' + md(d0) + ' ' + WD[tw(d0).wd] + '）';
+      o.value = String(d0); o.textContent = md(d0) + '（' + WD[tw(d0).wd] + '）';
       sel.appendChild(o);
     }
+  }
+  function markDay() {
+    var d0 = Number($('f-date').value), off = Math.round((DATA.today - d0) / DAY);
+    each('#day-chips [data-off]', function (b) { b.setAttribute('aria-pressed', String(Number(b.getAttribute('data-off')) === off)); });
+    $('dc-more').setAttribute('aria-pressed', String(off > 2));
+    $('dc-more-label').textContent = off > 2 ? md(d0) + '（' + WD[tw(d0).wd] + '）▾' : '更早 ▾';
   }
   function setWhen(t) {
     $('f-date').value = String(dayOf(t));
     if (!$('f-date').value) $('f-date').selectedIndex = 0;
     $('f-time').value = hm(t);
+    markDay();
   }
   function lastMl() {
     for (var i = DATA.feeds.length - 1; i >= 0; i--) { var m = DATA.feeds[i].label.match(/(\d+)ml/); if (m) return Number(m[1]); }
@@ -2594,18 +3100,14 @@ var DATA = __DATA__;
     if (DATA.sleepingSince) {
       $('sleep-state').textContent = '😴 ' + hm(DATA.sleepingSince) + ' 入睡，睡眠中';
       $('sleep-elapsed').textContent = dur(Math.max(0, nowMs() - DATA.sleepingSince));
-      $('sleep-elapsed').className = 'elapsed';
     } else {
       $('sleep-state').textContent = '☀️ 寶寶醒著';
-      $('sleep-elapsed').textContent = '入睡時按下方「開始睡覺」，醒來再按「醒來了」';
-      $('sleep-elapsed').className = 'elapsed idle';
+      $('sleep-elapsed').textContent = '按下面的按鈕開始計時';
     }
   }
   setInterval(function () { if (!overlay.hidden && S.kind === 'sleep') sleepTimerText(); }, 30000);
 
   function setKind(k) {
-    // 從「手動補登睡眠」切到別的類型時，時間回到現在
-    if (S.kind === 'sleep' && S.sleepMode === 'range' && k !== 'sleep' && !overlay.hidden) setWhen(nowMs());
     S.kind = k;
     press('kind-seg', k);
     var timer = k === 'sleep' && S.sleepMode === 'timer';
@@ -2615,7 +3117,6 @@ var DATA = __DATA__;
     });
     $('sleep-now').hidden = !timer;
     $('note-card').hidden = k === 'sleep' || k === 'weight';
-    $('f-memo').placeholder = { feed: '例如：喝得比較慢', diaper: '例如：有點紅屁屁', temp: '例如：耳溫' }[k] || '';
     $('f-time-lab').textContent = k !== 'sleep' ? '時間' : S.sleepMode === 'range' ? '入睡時間' : DATA.sleepingSince ? '醒來時間' : '入睡時間';
     if (timer) sleepTimerText();
     $('f-submit').textContent = timer ? (DATA.sleepingSince ? '☀️ 醒來了' : '🌙 開始睡覺') : '儲存紀錄';
@@ -2670,7 +3171,7 @@ var DATA = __DATA__;
       var end = day + (Number(e.slice(0, 2)) * 60 + Number(e.slice(3))) * MIN;
       if (end <= at) end += DAY; // 跨日，例如 23:00 睡到隔天 02:30
       if (end > nowMs() + 5 * MIN) return { err: '起床時間比現在晚' };
-      return { text: md(at) + ' 睡 ' + hm(at) + '-' + e, label: whenLabel + ' – ' + (dayOf(end) !== day ? '隔天 ' : '') + e + ' · 共 ' + dur(end - at) };
+      return { end: end, text: md(at) + ' 睡 ' + hm(at) + '-' + e, label: whenLabel + ' – ' + (dayOf(end) !== day ? '隔天 ' : '') + e + ' · 共 ' + dur(end - at) };
     }
     if (S.kind === 'diaper') {
       var name = { pee: '尿', poo: '便', both: '尿+便' }[S.diaper];
@@ -2687,10 +3188,44 @@ var DATA = __DATA__;
     return { text: when + '體重 ' + Number(S.kg).toFixed(2) + 'kg', label: whenLabel + ' · 體重 ' + Number(S.kg).toFixed(2) + 'kg' };
   }
 
+  // 這個時間前後 90 分鐘內已經有的紀錄；同類型 30 分鐘內有紀錄就提醒可能重複
+  var DUP_KINDS = { feed: 'feed', diaper: 'diaper', temp: 'temp', weight: 'growth' };
+  function nearby() {
+    var at = pickedTime(), list = $('nearby-list'), warn = $('dup-warn');
+    list.innerHTML = ''; warn.textContent = '';
+    if (at == null) { $('nearby').hidden = true; return; }
+    var timer = S.kind === 'sleep' && S.sleepMode === 'timer';
+    var near = DATA.records.filter(function (r) { return Math.abs(r.s - at) <= 90 * MIN || (r.k === 'sleep' && r.s <= at && (r.e || nowMs()) >= at); })
+      .sort(function (a, b) { return a.s - b.s; });
+    $('nearby').hidden = timer || !near.length && S.kind === 'sleep';
+    $('nearby-title').textContent = md(at) + ' ' + hm(at) + ' 前後的紀錄';
+    if (!near.length) { var li = document.createElement('li'); li.textContent = '前後 90 分鐘內沒有其他紀錄'; list.appendChild(li); }
+    var same = null;
+    near.forEach(function (r) {
+      var de = describeRec(r), li = document.createElement('li');
+      var isSame = DUP_KINDS[S.kind] === r.k && Math.abs(r.s - at) <= 30 * MIN;
+      if (isSame && !same) same = r;
+      li.className = isSame ? 'same' : '';
+      li.innerHTML = '<b>' + hm(r.s) + '</b><span>' + (KIND_INFO[r.k] || ['•'])[0] + ' ' + esc(de.title) + (de.time2 ? '（到 ' + de.time2 + '）' : '') + '</span>';
+      list.appendChild(li);
+    });
+    if (S.kind === 'sleep' && S.sleepMode === 'range') {
+      var b = build();
+      if (!b.err) {
+        var e0 = b.end, clash = DATA.records.filter(function (r) { return r.k === 'sleep' && r.s < e0 && (r.e || nowMs()) > at; })[0];
+        if (clash) warn.textContent = '⚠️ 跟已經記的睡眠 ' + hm(clash.s) + '–' + (clash.e ? hm(clash.e) : '現在') + ' 重疊了，這段可能已經記過。';
+      }
+    } else if (same) {
+      warn.textContent = '⚠️ ' + hm(same.s) + ' 已經有一筆「' + describeRec(same).title + '」，可能已經記過了。確定是另一次的話再按儲存。';
+    }
+  }
   function update() {
+    $('f-time-show').textContent = $('f-time').value || '--:--';
+    $('f-end-show').textContent = $('f-end').value || '--:--';
     var r = build();
     $('f-preview').textContent = r.err ? '' : r.label;
     $('f-err').textContent = '';
+    nearby();
     var b = $('temp-badge');
     b.className = 'badge' + (S.temp >= 38 ? ' crit' : S.temp >= 37.5 ? ' warn' : '');
     b.textContent = S.temp >= 38 ? '⚠️ 發燒，請留意寶寶狀況' : S.temp >= 37.5 ? '偏高，過一陣子再量一次' : '✓ 正常範圍';
@@ -2699,36 +3234,29 @@ var DATA = __DATA__;
   function openForm(o) {
     o = o || {};
     lastFocus = document.activeElement; tip.hidden = true;
-    form.classList.remove('is-done'); $('done').hidden = true;
-    var at = o.at || nowMs();
+    fromQuickReply = !!o.fromQuickReply;
+    var at = Math.min(o.at || nowMs(), nowMs());
     fillDates();
     setWhen(at);
     $('f-end').value = hm(Math.min(at + HOUR, nowMs()));
-    if (S.sleepMode === 'range' && !o.at) { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); }
     S.amounts.ml = lastMl();
     S.kg = lastKg();
     S.tags = []; press('feed-tags', '');
     S.color = ''; S.texture = ''; press('poo-color', ''); press('poo-texture', '');
     $('f-memo').value = '';
-    if (o.kind === 'sleep-range' || (o.at && (o.kind || S.kind) === 'sleep')) { S.sleepMode = 'range'; press('sleep-mode', 'range'); }
+    if (o.kind === 'sleep-range' || (o.at && o.kind === 'sleep')) { S.sleepMode = 'range'; press('sleep-mode', 'range'); }
     temp.set(S.temp); kg.set(S.kg);
     refreshAmount();
     overlay.hidden = false;
     setKind(o.kind === 'sleep-range' ? 'sleep' : o.kind || S.kind);
-    if (!MODE) $('add-close').focus();
+    $('add-close').focus();
   }
   function closeForm() {
-    if (MODE) { closeWindow(); return; }
     overlay.hidden = true; if (lastFocus && lastFocus.focus) lastFocus.focus();
   }
 
   // ---------- LIFF（從聊天室下方滑出的視窗） ----------
   var liffReady = false;
-  function closeWindow() {
-    if (liffReady) { try { liff.closeWindow(); return; } catch (e) {} }
-    try { window.top.close(); } catch (e) {}
-    $('done-msg').textContent = ($('done-msg').textContent ? $('done-msg').textContent + '\n\n' : '') + '往下滑或點左上角的 ✕ 就能關閉這個視窗。';
-  }
   if (LIFF_ID) {
     var sdk = document.createElement('script');
     sdk.src = 'https://static.line-scdn.net/liff/edge/2/sdk.js';
@@ -2741,19 +3269,6 @@ var DATA = __DATA__;
     if (!liffReady) return null;
     try { var c = liff.getContext(); return c && (c.type === 'utou' || c.type === 'group' || c.type === 'room') ? c : null; } catch (e) { return null; }
   }
-  function showDone(message) {
-    form.classList.add('is-done');
-    $('done').hidden = false;
-    $('done-msg').textContent = message;
-    $('done-close').focus();
-  }
-  $('done-again').addEventListener('click', function () { openForm({ kind: S.kind }); });
-  $('done-report').addEventListener('click', function () {
-    MODE = null; document.body.classList.remove('form-mode');
-    form.classList.remove('is-done'); $('done').hidden = true; overlay.hidden = true;
-    drawAll(); scrollTo(0, 0);
-  });
-  $('done-close').addEventListener('click', function () { if (MODE) closeWindow(); else closeForm(); });
   $('add-btn').addEventListener('click', function () { openForm(); });
   $('add-close').addEventListener('click', closeForm);
   overlay.addEventListener('click', function (e) { if (e.target === overlay) closeForm(); });
@@ -2768,22 +3283,19 @@ var DATA = __DATA__;
     saving = true; $('f-submit').disabled = true; $('f-submit').textContent = '儲存中…';
     function done() { saving = false; $('f-submit').disabled = false; $('f-submit').textContent = label; }
     function saveDirectly() {
-      if (typeof google === 'undefined' || !google.script || !google.script.run) { done(); $('f-err').textContent = '請從 LINE 裡的連結打開這個頁面，才能記錄。'; return; }
-      google.script.run
-        .withSuccessHandler(function (res) {
-          done();
-          if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || '儲存失敗，請再試一次。'; return; }
-          DATA = res.data; LOADED = Date.now();
-          if (MODE) { showDone(res.message); return; }
-          closeForm();
-          drawAll();
-          toast(res.message);
-        })
-        .withFailureHandler(function (err) { done(); $('f-err').textContent = '儲存失敗：' + (err && err.message ? err.message : err); })
-        .webAddRecord(KEY, { text: r.text });
+      run('webAddRecord', { text: r.text }, function (res) {
+        done();
+        var added = applyData(res);
+        closeForm();
+        // 記到別天的話，直接帶到那天的時間軸，看得到剛補上的紀錄
+        var rec = added[0];
+        if (rec && dayOf(rec.s) !== DATA.today) { showDay(dayOf(rec.s)); go('day'); }
+        renderAll();
+        toast(res.message);
+      }, function (msg) { done(); $('f-err').textContent = msg; });
     }
-    // 在 LINE 裡打開時，以你的名義把指令傳到聊天室，bot 會照常回覆；不行的話改成直接寫進試算表
-    if (MODE && chatContext()) {
+    // 從聊天室的「＋ 記錄」打開時，以你的名義把指令傳到聊天室，bot 會照常回覆；不行的話直接寫進試算表
+    if (fromQuickReply && chatContext()) {
       liff.sendMessages([{ type: 'text', text: r.text }])
         .then(function () { done(); liff.closeWindow(); })
         .catch(saveDirectly);
@@ -2794,16 +3306,20 @@ var DATA = __DATA__;
   var tt;
   function toast(s) { var t = $('toast'); t.textContent = s; t.hidden = false; clearTimeout(tt); tt = setTimeout(function () { t.hidden = true; }, 3500); }
 
-  function drawAll() { drawHeader(); drawTiles(); drawGaps(); drawRhythm(); drawTrends(); drawGrowth(); }
-  if (MODE) {
-    document.body.classList.add('form-mode');
-    $('add-h').textContent = '新增紀錄';
-    $('f-note').textContent = '補錯了可以在 LINE 輸入「復原」刪掉。';
-    openForm({ kind: MODE });
-  } else {
-    drawAll();
+  function renderAll() {
+    renderToday();
+    renderDiary();
+    if (current === 'day') renderDay();
+    if (current === 'trend') { drawTrends(); drawGrowth(); }
   }
-  var rt; addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { if (!MODE) drawAll(); }, 120); });
+  // 每分鐘更新一次「已睡多久」之類的時間
+  setInterval(function () { if (current === 'today' && overlay.hidden) renderToday(); }, 60000);
+
+  if (VIEW.day) curDay = Math.max(FIRST_DAY, Math.min(DATA.today, dayOf(Number(VIEW.day))));
+  renderAll();
+  go(VIEW.view || 'today');
+  if (MODE) openForm({ kind: MODE, fromQuickReply: true });
+  var rt; addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { if (current === 'day') drawRibbon(); if (current === 'trend') { drawTrends(); drawGrowth(); } }, 150); });
 })();
 </script>
 </body>
