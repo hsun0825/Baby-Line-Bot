@@ -14,7 +14,7 @@ const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 // ===================================
 
 // 程式版本：用瀏覽器打開部署網址會顯示，用來確認 LINE 用的是不是新程式
-const APP_VERSION = '2026-10-09 表單版';
+const APP_VERSION = '2026-10-11 療癒風表單';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
@@ -248,6 +248,9 @@ function doGet(e) {
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
+// 網頁表單只能新增紀錄，不能執行「復原」、「匯出」這類指令
+const WEB_ACTIONS = ['record', 'sleep_range', 'sleep_start', 'sleep_end'];
+
 /** 報表網頁的「補登」按鈕會呼叫這裡（google.script.run） */
 function webAddRecord(key, form) {
   const chatId = chatForReportKey(key);
@@ -255,9 +258,10 @@ function webAddRecord(key, form) {
   const now = new Date();
   let text;
   try {
-    text = webFormToText(form);
+    // 新版表單直接送出跟 LINE 一樣的文字指令；舊版送欄位
+    text = form && typeof form.text === 'string' ? form.text.replace(/[\r\n]+/g, ' ').trim().slice(0, 120) : webFormToText(form);
     const cmd = parseCommand(text, now);
-    if (!cmd || (cmd.action !== 'record' && cmd.action !== 'sleep_range')) return { ok: false, message: '看不懂要補登的內容，請再檢查一次。' };
+    if (!cmd || WEB_ACTIONS.indexOf(cmd.action) < 0) return { ok: false, message: '看不懂要記錄的內容，請再檢查一次。' };
   } catch (e) {
     if (e instanceof ParseError) return { ok: false, message: e.message };
     throw e;
@@ -1337,7 +1341,7 @@ BabyService.prototype.do_ask_feed_amount = function (chatId, cmd) {
 BabyService.prototype.do_sleep_start = function (chatId, cmd, userId, now) {
   const opened = this.storage.openSleep(chatId);
   if (opened) {
-    return '寶寶 ' + fmtTime(opened.start) + ' 就開始睡了（尚未起床）。\n' +
+    return '⚠️ 寶寶 ' + fmtTime(opened.start) + ' 就開始睡了（尚未起床）。\n' +
       '如果那筆是錯的，可以輸入「復原」刪掉，再重新輸入「睡覺」。';
   }
   const rec = this.storage.add(chatId, SLEEP, cmd.at, { userId: userId });
@@ -1346,9 +1350,9 @@ BabyService.prototype.do_sleep_start = function (chatId, cmd, userId, now) {
 
 BabyService.prototype.do_sleep_end = function (chatId, cmd, userId, now) {
   const opened = this.storage.openSleep(chatId);
-  if (!opened) return '找不到還沒結束的睡眠 🤔\n請先輸入「睡覺」，或用「睡 13:00-14:30」補登。';
+  if (!opened) return '⚠️ 找不到還沒結束的睡眠 🤔\n請先輸入「睡覺」，或用「睡 13:00-14:30」補登。';
   if (cmd.at <= opened.start) {
-    return '起床時間 ' + fmtTime(cmd.at) + ' 早於入睡時間 ' + fmtTime(opened.start) + '，請確認時間。';
+    return '⚠️ 起床時間 ' + fmtTime(cmd.at) + ' 早於入睡時間 ' + fmtTime(opened.start) + '，請確認時間。';
   }
   const rec = this.storage.setEnd(opened, cmd.at);
   return '☀️ ' + fmtTime(rec.end) + ' 起床！\n這次睡了 ' + fmtDuration(rec.end - rec.start);
@@ -1726,6 +1730,7 @@ BabyService.prototype.reportData = function (chatId, now) {
     lastTemp: lastTemp && lastTemp.value != null ? { t: lastTemp.start.getTime(), v: lastTemp.value } : null,
     lastDiaper: lastDiaper ? { t: lastDiaper.start.getTime(), label: lastDiaper.detail } : null,
     sleeping: !!s.openSleep(chatId),
+    sleepingSince: s.openSleep(chatId) ? s.openSleep(chatId).start.getTime() : null,
     prediction: p ? { at: p.at.getTime(), amount: p.amount } : null,
   };
 };
@@ -1749,51 +1754,60 @@ const REPORT_HTML = String.raw`<!DOCTYPE html>
 <meta charset="utf-8">
 <title>寶寶作息報表</title>
 <style>
+/* 日系療癒風：奶油白底、珊瑚粉主色、各功能淺色底；卡片 20px 圓角、按鈕 16px、觸控範圍至少 44px */
 :root {
-  --page: #f7f8f6; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
-  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --night: #eef1f6;
-  --accent: #2a78d6; --sleep: #2a78d6; --feed: #eb6834; --pee: #1baf7a; --poo: #eda100;
-  --band: rgba(42,120,214,0.08); --good: #006300; --chip-on: #0b0b0b; --chip-on-ink: #ffffff;
-  --warn: #b77a00; --warn-bg: rgba(250,178,25,0.10); --crit: #d03b3b;
-  --font: system-ui, -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Segoe UI", sans-serif;
+  --page: #FFF9F3; --surface: #FFFFFF; --ink: #45332C; --ink-2: #6E5D54; --muted: #91857D;
+  --brand: #FF8F91; --brand-ink: #45332C; --brand-soft: #FFE5E5;
+  --t-feed: #FFE5E5; --t-sleep: #E4EFFF; --t-diaper: #E0F5E9; --t-mile: #FFF2CC; --t-temp: #FFF2CC; --t-weight: #F3ECE6;
+  --grid: #EFE6DE; --axis: #D9CCC1; --border: rgba(69,51,44,0.10); --night: #F1F4FB;
+  --accent: #E8707A; --sleep: #5B8DE0; --feed: #EE7476; --pee: #3FAE80; --poo: #D99A1E;
+  --band: rgba(91,141,224,0.10); --good: #2E7D4F; --chip-on: #45332C; --chip-on-ink: #FFF9F3;
+  --warn: #B07A00; --warn-bg: rgba(250,178,25,0.12); --crit: #C8434A;
+  --shadow: 0 2px 10px rgba(69,51,44,0.06);
+  --font: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
-    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --night: #202329;
-    --accent: #3987e5; --sleep: #3987e5; --feed: #d95926; --pee: #199e70; --poo: #c98500;
-    --band: rgba(57,135,229,0.12); --good: #0ca30c; --chip-on: #ffffff; --chip-on-ink: #0b0b0b;
-    --warn: #fab219; --warn-bg: rgba(250,178,25,0.10); --crit: #e66767;
+    --page: #1A1513; --surface: #241D1A; --ink: #F6ECE5; --ink-2: #CDBFB5; --muted: #A29489;
+    --brand: #FF8F91; --brand-ink: #2A1A17; --brand-soft: #3A2627;
+    --t-feed: #3A2627; --t-sleep: #222C3D; --t-diaper: #1F3329; --t-mile: #3A321F; --t-temp: #3A321F; --t-weight: #33291F;
+    --grid: #342B27; --axis: #4A3E38; --border: rgba(255,240,230,0.10); --night: #1E2230;
+    --accent: #FF8F91; --sleep: #7EA6EC; --feed: #FF8F91; --pee: #5CC79A; --poo: #E8B23C;
+    --band: rgba(126,166,236,0.14); --good: #6FD39B; --chip-on: #F6ECE5; --chip-on-ink: #1A1513;
+    --warn: #F2B53A; --warn-bg: rgba(242,181,58,0.12); --crit: #FF8A8F;
+    --shadow: 0 2px 12px rgba(0,0,0,0.35);
     color-scheme: dark;
   }
 }
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 [hidden] { display: none !important; }
 html, body { margin: 0; }
-body { background: var(--page); color: var(--ink); font-family: var(--font); font-size: 14px; line-height: 1.5; }
-.wrap { max-width: 560px; margin: 0 auto; padding: 16px 16px 90px; display: flex; flex-direction: column; gap: 16px; }
+body { background: var(--page); color: var(--ink); font-family: var(--font); font-size: 15px; line-height: 1.5; -webkit-text-size-adjust: 100%; }
+button, input, select { font: inherit; color: inherit; }
+.wrap { max-width: 560px; margin: 0 auto; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(96px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 16px; }
 header { display: flex; flex-direction: column; gap: 4px; }
-.eyebrow { color: var(--ink-2); font-size: 12px; letter-spacing: .04em; }
-h1 { font-size: 22px; margin: 0; font-weight: 700; }
-h2 { font-size: 15px; margin: 0; font-weight: 650; }
+.eyebrow { color: var(--ink-2); font-size: 13px; }
+h1 { font-size: 24px; margin: 0; font-weight: 700; letter-spacing: .01em; }
+h2 { font-size: 16px; margin: 0; font-weight: 700; }
 .sub { color: var(--muted); font-size: 12px; margin: 0; }
-.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.panel { background: var(--surface); border-radius: 20px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; box-shadow: var(--shadow); }
 .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.tiles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
-.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.tile .k { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
-.tile .v { font-size: 24px; font-weight: 700; line-height: 1.2; }
-.tile .v small { font-size: 13px; font-weight: 500; color: var(--ink-2); margin-left: 2px; }
-.tile .d { font-size: 12px; color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+.tile { border-radius: 20px; padding: 14px; display: flex; flex-direction: column; gap: 2px; min-width: 0; background: var(--surface); box-shadow: var(--shadow); }
+.tile.feed { background: var(--t-feed); } .tile.sleep { background: var(--t-sleep); } .tile.diaper { background: var(--t-diaper); } .tile.temp { background: var(--t-temp); }
+.tile .k { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.tile .v { font-size: 28px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.tile .v small { font-size: 13px; font-weight: 600; color: var(--ink-2); margin-left: 2px; }
+.tile .d { font-size: 12px; color: var(--ink-2); }
 .tile.wide { grid-column: 1 / -1; flex-direction: row; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
 .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.chip { font: inherit; font-size: 12px; border: 1px solid var(--border); background: transparent; color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
-.chip[aria-pressed="true"] { background: var(--chip-on); color: var(--chip-on-ink); border-color: var(--chip-on); }
-.chip:focus-visible, .btn:focus-visible, .seg button:focus-visible, .field input:focus-visible, .field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip { font-size: 13px; border: 0; background: var(--page); color: var(--ink-2); border-radius: 999px; padding: 6px 12px; min-height: 32px; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--brand); color: var(--brand-ink); font-weight: 700; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 svg { display: block; width: 100%; overflow: visible; }
 svg text { fill: var(--muted); font-family: var(--font); font-size: 10px; font-variant-numeric: tabular-nums; }
 svg text.rowlab { fill: var(--ink-2); font-size: 11px; }
@@ -1801,51 +1815,96 @@ svg text.vlab { fill: var(--ink-2); }
 .mini { display: flex; flex-direction: column; gap: 4px; }
 .mini-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; color: var(--ink-2); gap: 8px; flex-wrap: wrap; }
 .mini-title b { color: var(--ink); font-size: 13px; }
-.tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px; line-height: 1.45; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 220px; white-space: pre-line; }
+.tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface); color: var(--ink); border-radius: 12px; padding: 8px 10px; font-size: 12px; line-height: 1.45; box-shadow: 0 6px 20px rgba(69,51,44,.18); max-width: 230px; white-space: pre-line; }
 details { font-size: 13px; }
-summary { cursor: pointer; color: var(--ink-2); }
+summary { cursor: pointer; color: var(--ink-2); min-height: 32px; display: flex; align-items: center; }
 .tbl { overflow-x: auto; margin-top: 8px; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 12px; }
-th, td { padding: 5px 6px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th, td { padding: 6px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 th:first-child, td:first-child { text-align: left; }
 th { color: var(--ink-2); font-weight: 600; }
 .note { font-size: 12px; color: var(--muted); margin: 0; }
-.btn { font: inherit; font-size: 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 8px 12px; cursor: pointer; }
-.btn.primary { background: var(--chip-on); color: var(--chip-on-ink); border-color: var(--chip-on); font-weight: 600; }
+.btn { font-size: 15px; border: 0; border-radius: 16px; background: var(--page); color: var(--ink); padding: 10px 16px; min-height: 44px; cursor: pointer; font-weight: 600; }
+.btn.primary { background: var(--brand); color: var(--brand-ink); font-weight: 700; }
 .btn[disabled] { opacity: .6; cursor: progress; }
-.addbar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; pointer-events: none; z-index: 5; }
-.addbar .btn { pointer-events: auto; box-shadow: 0 4px 16px rgba(0,0,0,.18); border-radius: 999px; padding: 10px 20px; font-size: 14px; }
-.gaps { display: flex; flex-direction: column; gap: 6px; }
-.gap-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 8px 10px; border: 1px dashed var(--warn); border-radius: 8px; background: var(--warn-bg); }
-.gap-row b { font-weight: 600; }
-.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 20; display: flex; align-items: flex-end; justify-content: center; }
-.sheet { background: var(--surface); color: var(--ink); width: 100%; max-width: 560px; border-radius: 16px 16px 0 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 12px; max-height: 92%; overflow-y: auto; }
-.sheet-head { display: flex; justify-content: space-between; align-items: center; }
-.sheet-head h2 { font-size: 17px; }
-.x { font: inherit; font-size: 22px; line-height: 1; background: none; border: 0; color: var(--ink-2); cursor: pointer; padding: 4px 8px; }
-.seg { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 6px; }
-.seg.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
-.seg button { font: inherit; font-size: 12px; border: 1px solid var(--border); background: transparent; color: var(--ink); border-radius: 10px; padding: 8px 2px; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 2px; }
-.seg button span { font-size: 18px; }
-.seg button[aria-pressed="true"] { border-color: var(--ink); background: var(--page); font-weight: 600; }
-.fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
-.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; color: var(--ink-2); }
-.field.full { grid-column: 1 / -1; }
-.field input, .field select { font: inherit; font-size: 16px; color: var(--ink); background: var(--page); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%; min-width: 0; }
-.err { color: var(--crit); font-size: 13px; min-height: 1em; white-space: pre-line; }
-.preview-line { font-size: 13px; color: var(--ink-2); background: var(--page); border-radius: 8px; padding: 8px 10px; }
-.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(70px + env(safe-area-inset-bottom, 0px)); z-index: 30; background: var(--chip-on); color: var(--chip-on-ink); padding: 9px 14px; border-radius: 10px; font-size: 13px; max-width: calc(100% - 32px); box-shadow: 0 4px 16px rgba(0,0,0,.2); white-space: pre-line; }
+.addbar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; pointer-events: none; z-index: 5; }
+.addbar .btn { pointer-events: auto; box-shadow: 0 6px 18px rgba(255,143,145,.45); border-radius: 999px; padding: 12px 24px; }
+.gaps { display: flex; flex-direction: column; gap: 8px; }
+.gap-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 10px 12px; border: 1px dashed var(--warn); border-radius: 16px; background: var(--warn-bg); }
+.gap-row b { font-weight: 700; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(80px + env(safe-area-inset-bottom, 0px)); z-index: 30; background: var(--chip-on); color: var(--chip-on-ink); padding: 10px 16px; border-radius: 16px; font-size: 14px; max-width: calc(100% - 32px); box-shadow: 0 6px 18px rgba(0,0,0,.2); white-space: pre-line; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+/* ---------- 記錄表單 ---------- */
+.overlay { position: fixed; inset: 0; background: rgba(40,28,24,.38); z-index: 20; display: flex; align-items: flex-end; justify-content: center; }
+.sheet { background: var(--page); color: var(--ink); width: 100%; max-width: 560px; border-radius: 24px 24px 0 0; padding: 8px 16px 0; display: flex; flex-direction: column; gap: 14px; max-height: 94%; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.grip { width: 40px; height: 5px; border-radius: 3px; background: var(--axis); align-self: center; margin-top: 2px; }
+.sheet-head { display: flex; justify-content: space-between; align-items: center; min-height: 44px; }
+.sheet-head h2 { font-size: 20px; }
+.x { font-size: 18px; background: var(--surface); border: 0; color: var(--ink-2); cursor: pointer; width: 44px; height: 44px; border-radius: 50%; box-shadow: var(--shadow); }
+.kinds { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 8px; }
+.kind { border: 2px solid transparent; border-radius: 18px; padding: 10px 2px 8px; min-height: 72px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font-size: 13px; font-weight: 600; color: var(--ink); }
+.kind .ic { font-size: 24px; line-height: 1; }
+.kind[data-kind="feed"] { background: var(--t-feed); } .kind[data-kind="sleep"] { background: var(--t-sleep); }
+.kind[data-kind="diaper"] { background: var(--t-diaper); } .kind[data-kind="temp"] { background: var(--t-temp); }
+.kind[data-kind="weight"] { background: var(--t-weight); }
+.kind[aria-pressed="true"] { border-color: var(--brand); box-shadow: 0 4px 14px rgba(255,143,145,.35); }
+.kind[aria-pressed="false"] { opacity: .78; }
+.card { background: var(--surface); border-radius: 20px; padding: 14px; display: flex; flex-direction: column; gap: 12px; box-shadow: var(--shadow); }
+.label { font-size: 13px; color: var(--muted); font-weight: 600; }
+.when { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); gap: 10px; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field select, .field input { font-size: 17px; font-weight: 600; background: var(--page); border: 0; border-radius: 14px; padding: 10px 12px; min-height: 48px; width: 100%; min-width: 0; color: var(--ink); font-variant-numeric: tabular-nums; }
+.pills { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill { border: 0; background: var(--page); color: var(--ink); border-radius: 14px; padding: 8px 14px; min-height: 44px; cursor: pointer; font-size: 15px; display: inline-flex; align-items: center; gap: 6px; }
+.pill[aria-pressed="true"] { background: var(--brand); color: var(--brand-ink); font-weight: 700; }
+.pill .dot { width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(0,0,0,.12); }
+.pills.even { display: grid; grid-template-columns: repeat(auto-fit, minmax(0,1fr)); }
+.pills.even .pill { justify-content: center; }
+.stepper { display: grid; grid-template-columns: 52px 52px minmax(0,1fr) 52px 52px; gap: 6px; align-items: stretch; }
+.step { border: 0; background: var(--page); border-radius: 14px; min-height: 56px; font-size: 16px; font-weight: 700; color: var(--ink-2); cursor: pointer; font-variant-numeric: tabular-nums; }
+.step:active { background: var(--brand-soft); }
+.step-val { display: flex; align-items: baseline; justify-content: center; gap: 4px; background: var(--brand-soft); border-radius: 14px; padding: 0 6px; min-width: 0; }
+.step-val input { width: 100%; min-width: 0; border: 0; background: transparent; text-align: right; font-size: 30px; font-weight: 800; color: var(--ink); padding: 6px 0; font-variant-numeric: tabular-nums; -moz-appearance: textfield; }
+.step-val input::-webkit-outer-spin-button, .step-val input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.step-val span { font-size: 15px; font-weight: 700; color: var(--ink-2); flex: none; }
+.big3 { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+.big { border: 2px solid transparent; background: var(--t-diaper); border-radius: 20px; min-height: 92px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; font-size: 15px; font-weight: 700; color: var(--ink); }
+.big .ic { font-size: 28px; line-height: 1; }
+.big[aria-pressed="true"] { border-color: var(--brand); box-shadow: 0 4px 14px rgba(255,143,145,.35); }
+.sleep-now { background: var(--t-sleep); border-radius: 20px; padding: 16px; text-align: center; display: flex; flex-direction: column; gap: 4px; }
+.sleep-now .state { font-size: 15px; color: var(--ink-2); font-weight: 600; }
+.sleep-now .elapsed { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-now .elapsed.idle { font-size: 15px; font-weight: 600; color: var(--ink-2); }
+.badge { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: var(--page); color: var(--ink-2); align-self: center; }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.badge.crit { background: var(--brand-soft); color: var(--crit); }
+.more summary { font-weight: 600; }
+.more[open] summary { margin-bottom: 8px; }
+.more .label { margin: 4px 0 6px; }
+.preview-line { font-size: 14px; color: var(--ink-2); text-align: center; }
+.err { color: var(--crit); font-size: 14px; font-weight: 600; text-align: center; white-space: pre-line; }
+.err:empty { display: none; }
+.savebar { position: sticky; bottom: 0; margin: 0 -16px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to top, var(--page) 75%, transparent); }
+.savebar .btn { width: 100%; min-height: 56px; font-size: 18px; border-radius: 18px; box-shadow: 0 6px 18px rgba(255,143,145,.45); }
+.done { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px 0 calc(20px + env(safe-area-inset-bottom, 0px)); text-align: center; }
+.done-check { width: 72px; height: 72px; border-radius: 50%; background: var(--t-diaper); display: flex; align-items: center; justify-content: center; font-size: 34px; }
+.done-msg { white-space: pre-line; font-size: 16px; line-height: 1.6; }
+.done-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; width: 100%; }
+.done-actions .btn.primary { grid-column: 1 / -1; min-height: 52px; }
+.done-actions .btn:not(.primary) { background: var(--surface); box-shadow: var(--shadow); }
+form.is-done > :not(.sheet-head):not(.done):not(.grip) { display: none !important; }
+@media (prefers-reduced-motion: no-preference) {
+  .overlay:not([hidden]) .sheet { animation: rise .22s ease-out; }
+  @keyframes rise { from { transform: translateY(24px); opacity: .6; } }
+  .toast { animation: fade .2s ease-out; } @keyframes fade { from { opacity: 0; } }
+}
 /* 從快速按鈕打開時：只顯示記錄表單 */
 body.form-mode .wrap, body.form-mode .addbar { display: none; }
 body.form-mode .overlay { position: static; background: transparent; display: block; }
-body.form-mode { background: var(--surface); }
-body.form-mode .sheet { border-radius: 0; max-height: none; min-height: 100vh; margin: 0 auto; }
-.done { display: flex; flex-direction: column; gap: 10px; }
-.done-msg { white-space: pre-line; font-size: 15px; background: var(--page); border-radius: 10px; padding: 12px; }
-.done-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.done-actions .btn { flex: 1 1 auto; }
-form.is-done > :not(.sheet-head):not(.done) { display: none !important; }
+body.form-mode .sheet { border-radius: 0; max-height: none; min-height: 100vh; margin: 0 auto; padding-top: calc(8px + env(safe-area-inset-top, 0px)); animation: none; }
+body.form-mode .grip { display: none; }
+@media (max-width: 360px) { .stepper { grid-template-columns: 44px 44px minmax(0,1fr) 44px 44px; } .kind { font-size: 12px; } }
 </style>
 </head>
 <body>
@@ -1918,45 +1977,132 @@ form.is-done > :not(.sheet-head):not(.done) { display: none !important; }
 </div>
 
 <div class="tip" id="tip" hidden></div>
-<div class="addbar"><button class="btn primary" id="add-btn" type="button">＋ 補登紀錄</button></div>
+<div class="addbar"><button class="btn primary" id="add-btn" type="button">＋ 新增紀錄</button></div>
 <div class="toast" id="toast" role="status" hidden></div>
 
 <div class="overlay" id="overlay" hidden>
   <form class="sheet" id="add-form" role="dialog" aria-modal="true" aria-labelledby="add-h" novalidate>
-    <div class="sheet-head"><h2 id="add-h">補登紀錄</h2><button class="x" type="button" id="add-close" aria-label="關閉">×</button></div>
-    <div class="seg" role="group" aria-label="類型" id="kind-seg">
-      <button type="button" id="k-feed" data-kind="feed" aria-pressed="true"><span>🍼</span>餵奶</button>
-      <button type="button" id="k-sleep" data-kind="sleep" aria-pressed="false"><span>😴</span>睡眠</button>
-      <button type="button" id="k-diaper" data-kind="diaper" aria-pressed="false"><span>🧷</span>尿布</button>
-      <button type="button" id="k-temp" data-kind="temp" aria-pressed="false"><span>🌡️</span>體溫</button>
-      <button type="button" id="k-weight" data-kind="weight" aria-pressed="false"><span>⚖️</span>體重</button>
+    <div class="grip" aria-hidden="true"></div>
+    <div class="sheet-head"><h2 id="add-h">新增紀錄</h2><button class="x" type="button" id="add-close" aria-label="關閉">✕</button></div>
+
+    <div class="kinds" role="group" aria-label="紀錄類型" id="kind-seg">
+      <button type="button" class="kind" id="k-feed" data-kind="feed" data-v="feed" aria-pressed="true"><span class="ic" aria-hidden="true">🍼</span>喝奶</button>
+      <button type="button" class="kind" id="k-sleep" data-kind="sleep" data-v="sleep" aria-pressed="false"><span class="ic" aria-hidden="true">🌙</span>睡眠</button>
+      <button type="button" class="kind" id="k-diaper" data-kind="diaper" data-v="diaper" aria-pressed="false"><span class="ic" aria-hidden="true">🧷</span>尿布</button>
+      <button type="button" class="kind" id="k-temp" data-kind="temp" data-v="temp" aria-pressed="false"><span class="ic" aria-hidden="true">🌡️</span>體溫</button>
+      <button type="button" class="kind" id="k-weight" data-kind="weight" data-v="weight" aria-pressed="false"><span class="ic" aria-hidden="true">⚖️</span>體重</button>
     </div>
-    <div class="fields">
-      <label class="field"><span>日期</span><select id="f-date"></select></label>
-      <label class="field"><span id="f-time-lab">時間</span><input type="time" id="f-time" step="300"></label>
-      <label class="field" data-for="sleep"><span>醒來時間</span><input type="time" id="f-end" step="300"></label>
-      <label class="field" data-for="feed"><span>種類</span><select id="f-feedtype"><option value="配方奶">配方奶</option><option value="瓶餵母乳">瓶餵母乳</option><option value="母乳">親餵</option><option value="副食品">副食品</option></select></label>
-      <label class="field" data-for="feed"><span id="f-ml-lab">奶量 (ml)</span><input type="number" id="f-ml" inputmode="numeric" min="1" max="400" step="10"></label>
-      <div class="field full" data-for="diaper"><span>內容</span><div class="seg three" id="diaper-seg">
-        <button type="button" id="d-pee" data-v="pee" aria-pressed="true">💧 尿</button>
-        <button type="button" id="d-poo" data-v="poo" aria-pressed="false">💩 便</button>
-        <button type="button" id="d-both" data-v="both" aria-pressed="false">尿＋便</button>
-      </div></div>
-      <label class="field" data-for="temp"><span>體溫 (°C)</span><input type="number" id="f-temp" inputmode="decimal" min="34" max="42" step="0.1" value="37.0"></label>
-      <label class="field" data-for="weight"><span>體重 (kg)</span><input type="number" id="f-kg" inputmode="decimal" min="1" max="20" step="0.01"></label>
+
+    <div class="card" data-for="sleep">
+      <div class="pills even" role="group" aria-label="睡眠記錄方式" id="sleep-mode">
+        <button type="button" class="pill" id="sm-timer" data-v="timer" aria-pressed="true">⏱ 即時計時</button>
+        <button type="button" class="pill" id="sm-range" data-v="range" aria-pressed="false">✍️ 手動補登</button>
+      </div>
+      <div class="sleep-now" id="sleep-now">
+        <div class="state" id="sleep-state"></div>
+        <div class="elapsed" id="sleep-elapsed"></div>
+      </div>
     </div>
+
+    <div class="card">
+      <div class="when">
+        <label class="field"><span class="label">日期</span><select id="f-date"></select></label>
+        <label class="field"><span class="label" id="f-time-lab">時間</span><input type="time" id="f-time"></label>
+      </div>
+      <label class="field" data-for="sleep-range"><span class="label">起床時間</span><input type="time" id="f-end"></label>
+      <div class="pills" id="when-chips" aria-label="快速選時間">
+        <button type="button" class="pill" id="ago-0" data-ago="0">現在</button>
+        <button type="button" class="pill" id="ago-15" data-ago="15">15 分前</button>
+        <button type="button" class="pill" id="ago-30" data-ago="30">30 分前</button>
+        <button type="button" class="pill" id="ago-60" data-ago="60">1 小時前</button>
+      </div>
+    </div>
+
+    <div class="card" data-for="feed">
+      <span class="label">餵食方式</span>
+      <div class="pills" role="group" aria-label="餵食方式" id="feed-type">
+        <button type="button" class="pill" id="ft-formula" data-v="配方奶" aria-pressed="true">配方奶</button>
+        <button type="button" class="pill" id="ft-bottle" data-v="瓶餵母乳" aria-pressed="false">母乳瓶餵</button>
+        <button type="button" class="pill" id="ft-breast" data-v="母乳" aria-pressed="false">母乳親餵</button>
+        <button type="button" class="pill" id="ft-mixed" data-v="混合" aria-pressed="false">混合餵養</button>
+        <button type="button" class="pill" id="ft-solid" data-v="副食品" aria-pressed="false">副食品</button>
+      </div>
+      <div id="side-wrap" hidden>
+        <span class="label">哪一側</span>
+        <div class="pills even" role="group" aria-label="親餵哪一側" id="feed-side">
+          <button type="button" class="pill" id="fs-l" data-v="左" aria-pressed="true">左側</button>
+          <button type="button" class="pill" id="fs-r" data-v="右" aria-pressed="false">右側</button>
+          <button type="button" class="pill" id="fs-b" data-v="雙邊" aria-pressed="false">雙側</button>
+        </div>
+      </div>
+      <span class="label" id="amount-lab">喝奶量</span>
+      <div class="stepper" id="amount-stepper"></div>
+      <span class="label">狀態（可複選）</span>
+      <div class="pills" role="group" aria-label="餵食狀態" id="feed-tags">
+        <button type="button" class="pill" id="tg-1" data-v="喝得順利" aria-pressed="false">😊 喝得順利</button>
+        <button type="button" class="pill" id="tg-2" data-v="吐奶" aria-pressed="false">💦 吐奶</button>
+        <button type="button" class="pill" id="tg-3" data-v="拍嗝完成" aria-pressed="false">👋 拍嗝完成</button>
+        <button type="button" class="pill" id="tg-4" data-v="喝到睡著" aria-pressed="false">😴 喝到睡著</button>
+      </div>
+    </div>
+
+    <div class="card" data-for="diaper">
+      <div class="big3" role="group" aria-label="尿布內容" id="diaper-seg">
+        <button type="button" class="big" id="d-pee" data-v="pee" aria-pressed="true"><span class="ic" aria-hidden="true">💧</span>尿尿</button>
+        <button type="button" class="big" id="d-poo" data-v="poo" aria-pressed="false"><span class="ic" aria-hidden="true">💩</span>大便</button>
+        <button type="button" class="big" id="d-both" data-v="both" aria-pressed="false"><span class="ic" aria-hidden="true">💧💩</span>尿尿＋大便</button>
+      </div>
+      <details class="more" id="poo-more" hidden>
+        <summary>大便顏色、質地（選填）</summary>
+        <div class="label">顏色</div>
+        <div class="pills" role="group" aria-label="大便顏色" id="poo-color">
+          <button type="button" class="pill" id="pc-1" data-v="黃色" aria-pressed="false"><i class="dot" style="background:#E8C547"></i>黃色</button>
+          <button type="button" class="pill" id="pc-2" data-v="綠色" aria-pressed="false"><i class="dot" style="background:#7FA650"></i>綠色</button>
+          <button type="button" class="pill" id="pc-3" data-v="褐色" aria-pressed="false"><i class="dot" style="background:#9A6B3F"></i>褐色</button>
+          <button type="button" class="pill" id="pc-4" data-v="黑色" aria-pressed="false"><i class="dot" style="background:#2E2622"></i>黑色</button>
+          <button type="button" class="pill" id="pc-5" data-v="紅色" aria-pressed="false"><i class="dot" style="background:#C8434A"></i>紅色</button>
+          <button type="button" class="pill" id="pc-6" data-v="白色" aria-pressed="false"><i class="dot" style="background:#F4F1EA"></i>白色</button>
+        </div>
+        <div class="label">質地</div>
+        <div class="pills" role="group" aria-label="大便質地" id="poo-texture">
+          <button type="button" class="pill" id="px-1" data-v="水狀" aria-pressed="false">水狀</button>
+          <button type="button" class="pill" id="px-2" data-v="糊狀" aria-pressed="false">糊狀</button>
+          <button type="button" class="pill" id="px-3" data-v="軟" aria-pressed="false">軟</button>
+          <button type="button" class="pill" id="px-4" data-v="成形" aria-pressed="false">成形</button>
+          <button type="button" class="pill" id="px-5" data-v="顆粒" aria-pressed="false">顆粒</button>
+        </div>
+      </details>
+    </div>
+
+    <div class="card" data-for="temp">
+      <span class="label">體溫</span>
+      <div class="stepper" id="temp-stepper"></div>
+      <span class="badge" id="temp-badge"></span>
+    </div>
+
+    <div class="card" data-for="weight">
+      <span class="label">體重</span>
+      <div class="stepper" id="kg-stepper"></div>
+    </div>
+
+    <div class="card" id="note-card">
+      <label class="field"><span class="label">備註（選填）</span><input type="text" id="f-memo" maxlength="30" placeholder="例如：喝得比較慢" autocomplete="off"></label>
+    </div>
+
     <div class="preview-line" id="f-preview"></div>
     <div class="err" id="f-err" role="alert"></div>
-    <button class="btn primary" type="submit" id="f-submit">補登</button>
+    <p class="note" id="f-note">會寫進試算表，跟在 LINE 打字記錄一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
+    <div class="savebar"><button class="btn primary" type="submit" id="f-submit">儲存紀錄</button></div>
+
     <div class="done" id="done" hidden>
+      <div class="done-check" aria-hidden="true">✓</div>
       <div class="done-msg" id="done-msg"></div>
       <div class="done-actions">
         <button class="btn" type="button" id="done-again">再記一筆</button>
         <button class="btn" type="button" id="done-report">看報表</button>
-        <button class="btn primary" type="button" id="done-close">關閉</button>
+        <button class="btn primary" type="button" id="done-close">完成</button>
       </div>
     </div>
-    <p class="note" id="f-note">會直接寫進試算表，跟在 LINE 打「10/6 14:30 配方奶 120」的效果一樣。補錯了可以在 LINE 輸入「復原」刪掉。</p>
   </form>
 </div>
 
@@ -2031,15 +2177,15 @@ var DATA = __DATA__;
   function drawTiles() {
     var days = DATA.days, today = days[days.length - 1], yday = days[days.length - 2];
     var html = '';
-    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--feed)"></i>今日奶量</span>' +
+    html += '<div class="tile feed"><span class="k">🍼 今日奶量</span>' +
       '<span class="v">' + today.ml + '<small>ml</small></span><span class="d">' + today.n + ' 餐' + (today.breast ? ' · 親餵 ' + today.breast + ' 分' : '') + ' · 昨天 ' + yday.ml + 'ml</span></div>';
-    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--sleep)"></i>今日睡眠</span>' +
+    html += '<div class="tile sleep"><span class="k">🌙 今日睡眠</span>' +
       '<span class="v">' + today.sleepH.toFixed(1) + '<small>小時</small></span><span class="d">' + (DATA.sleeping ? '現在正在睡 😴' : '現在醒著') + ' · 昨天 ' + yday.sleepH.toFixed(1) + 'h</span></div>';
-    html += '<div class="tile"><span class="k"><i class="sw" style="background:var(--pee)"></i>尿布</span>' +
+    html += '<div class="tile diaper"><span class="k">🧷 尿布</span>' +
       '<span class="v">' + today.pee + '<small>尿</small> ' + today.poo + '<small>便</small></span><span class="d">' +
       (DATA.lastDiaper ? '上次 ' + dayLabel(dayOf(DATA.lastDiaper.t)) + ' ' + hm(DATA.lastDiaper.t) : '還沒有紀錄') + '</span></div>';
     var t = DATA.lastTemp;
-    html += '<div class="tile"><span class="k">🌡️ 體溫</span>' + (t
+    html += '<div class="tile temp"><span class="k">🌡️ 體溫</span>' + (t
       ? '<span class="v">' + t.v.toFixed(1) + '<small>°C</small></span><span class="d">' + dayLabel(dayOf(t.t)) + ' ' + hm(t.t) + ' · ' + (t.v >= 38 ? '發燒' : t.v >= 37.5 ? '偏高' : '正常') + '</span>'
       : '<span class="v">–</span><span class="d">還沒有紀錄</span>') + '</div>';
     var f = DATA.lastFeed, pr = DATA.prediction;
@@ -2323,79 +2469,253 @@ var DATA = __DATA__;
     });
   });
 
-  // ---------- 補登表單 ----------
-  var overlay = $('overlay'), form = $('add-form'), kind = 'feed', diaperV = 'pee', lastFocus = null, saving = false;
+  // ---------- 記錄表單 ----------
+  var overlay = $('overlay'), form = $('add-form'), lastFocus = null, saving = false;
+  var LOADED = Date.now();
+  function nowMs() { return DATA.now + (Date.now() - LOADED); }
+  var S = { kind: 'feed', feedType: '配方奶', side: '左', tags: [], sleepMode: 'timer', diaper: 'pee', color: '', texture: '',
+    amounts: { ml: 120, min: 15, g: 30 }, temp: 37.0, kg: '' };
+
+  function each(sel, fn) { Array.prototype.forEach.call(document.querySelectorAll(sel), fn); }
+  // 一組按鈕（單選；multi 為複選；optional 為可以取消選取）
+  function pills(id, opts) {
+    each('#' + id + ' [data-v]', function (b) {
+      b.addEventListener('click', function () {
+        var v = b.getAttribute('data-v'), on = b.getAttribute('aria-pressed') === 'true';
+        if (opts.multi) b.setAttribute('aria-pressed', String(!on));
+        else each('#' + id + ' [data-v]', function (o) { o.setAttribute('aria-pressed', String(o === b && !(opts.optional && on))); });
+        var picked = [];
+        each('#' + id + ' [data-v]', function (o) { if (o.getAttribute('aria-pressed') === 'true') picked.push(o.getAttribute('data-v')); });
+        opts.change(opts.multi ? picked : (picked[0] || ''));
+        update();
+      });
+    });
+  }
+  function press(id, v) { each('#' + id + ' [data-v]', function (o) { o.setAttribute('aria-pressed', String(o.getAttribute('data-v') === v)); }); }
+
+  // 數值加減器：[-大][-小][數值][+小][+大]
+  function stepper(id, cfg) {
+    var host = $(id);
+    host.innerHTML = '';
+    function btn(d) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'step'; b.id = id + '-' + (d < 0 ? 'm' : 'p') + String(Math.abs(d)).replace('.', '_');
+      b.textContent = (d < 0 ? '−' : '+') + Math.abs(d);
+      b.setAttribute('aria-label', (d < 0 ? '減 ' : '加 ') + Math.abs(d));
+      b.addEventListener('click', function () {
+        var v = Number(input.value) || 0;
+        v = Math.round((v + d) / cfg.round) * cfg.round;
+        v = Math.max(cfg.min, Math.min(cfg.max, v));
+        input.value = cfg.fmt(v); cfg.change(v); update();
+      });
+      return b;
+    }
+    var wrap = document.createElement('label'); wrap.className = 'step-val';
+    var input = document.createElement('input');
+    input.type = 'number'; input.id = id + '-val'; input.inputMode = cfg.decimal ? 'decimal' : 'numeric';
+    input.step = String(cfg.round); input.setAttribute('aria-label', cfg.label);
+    input.addEventListener('input', function () { cfg.change(Number(input.value)); update(); });
+    input.addEventListener('focus', function () { input.select(); });
+    var unit = document.createElement('span'); unit.textContent = cfg.unit;
+    wrap.appendChild(input); wrap.appendChild(unit);
+    host.appendChild(btn(-cfg.big)); host.appendChild(btn(-cfg.small)); host.appendChild(wrap); host.appendChild(btn(cfg.small)); host.appendChild(btn(cfg.big));
+    return { set: function (v, u) { input.value = v === '' ? '' : cfg.fmt(v); if (u) unit.textContent = u; }, input: input };
+  }
+
+  function amountCfg() {
+    if (S.feedType === '母乳') return { key: 'min', unit: '分鐘', label: '親餵時間', small: 1, big: 5, min: 1, max: 90 };
+    if (S.feedType === '副食品') return { key: 'g', unit: 'g', label: '份量', small: 5, big: 10, min: 1, max: 500 };
+    return { key: 'ml', unit: 'ml', label: '喝奶量', small: 5, big: 10, min: 5, max: 400 };
+  }
+  var amount = stepper('amount-stepper', { label: '數量', unit: 'ml', small: 5, big: 10, round: 1, min: 1, max: 500,
+    fmt: function (v) { return String(Math.round(v)); },
+    change: function (v) { S.amounts[amountCfg().key] = v; } });
+  // 加減器的級距跟著餵食方式變
+  function refreshAmount() {
+    var c = amountCfg();
+    $('amount-lab').textContent = c.label;
+    var bs = $('amount-stepper').querySelectorAll('.step');
+    [-c.big, -c.small, c.small, c.big].forEach(function (d, i) {
+      var b = bs[i], fresh = b.cloneNode(false);
+      fresh.textContent = (d < 0 ? '−' : '+') + Math.abs(d);
+      fresh.addEventListener('click', function () {
+        var v = Math.max(c.min, Math.min(c.max, (Number(amount.input.value) || 0) + d));
+        amount.input.value = String(v); S.amounts[c.key] = v; update();
+      });
+      b.parentNode.replaceChild(fresh, b);
+    });
+    amount.set(S.amounts[c.key], c.unit);
+    $('side-wrap').hidden = S.feedType !== '母乳';
+  }
+  var temp = stepper('temp-stepper', { label: '體溫', unit: '°C', small: 0.1, big: 0.5, round: 0.1, min: 34, max: 42, decimal: true,
+    fmt: function (v) { return v.toFixed(1); }, change: function (v) { S.temp = v; } });
+  var kg = stepper('kg-stepper', { label: '體重', unit: 'kg', small: 0.01, big: 0.1, round: 0.01, min: 1, max: 30, decimal: true,
+    fmt: function (v) { return v.toFixed(2); }, change: function (v) { S.kg = v; } });
+
+  pills('kind-seg', { change: function (v) { setKind(v); } });
+  pills('feed-type', { change: function (v) { S.feedType = v; refreshAmount(); } });
+  pills('feed-side', { change: function (v) { S.side = v; } });
+  pills('feed-tags', { multi: true, change: function (v) { S.tags = v; } });
+  pills('sleep-mode', { change: function (v) {
+    S.sleepMode = v;
+    // 手動補登預設「一小時前睡到現在」
+    if (v === 'range') { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); } else { setWhen(nowMs()); }
+    setKind('sleep');
+  } });
+  pills('diaper-seg', { change: function (v) { S.diaper = v; $('poo-more').hidden = v === 'pee'; } });
+  pills('poo-color', { optional: true, change: function (v) { S.color = v; } });
+  pills('poo-texture', { optional: true, change: function (v) { S.texture = v; } });
+  each('#when-chips [data-ago]', function (b) {
+    b.addEventListener('click', function () { setWhen(nowMs() - Number(b.getAttribute('data-ago')) * MIN); update(); });
+  });
+  form.addEventListener('input', update);
+  form.addEventListener('change', update);
+
   function fillDates() {
     var sel = $('f-date'); sel.innerHTML = '';
     for (var i = 0; i < 7; i++) {
       var d0 = DATA.today - i * DAY, o = document.createElement('option');
-      o.value = String(d0); o.textContent = dayLabel(d0) + (i < 2 ? '（' + md(d0) + '）' : '');
+      o.value = String(d0); o.textContent = dayLabel(d0) + '（' + md(d0) + ' ' + WD[tw(d0).wd] + '）';
       sel.appendChild(o);
     }
+  }
+  function setWhen(t) {
+    $('f-date').value = String(dayOf(t));
+    if (!$('f-date').value) $('f-date').selectedIndex = 0;
+    $('f-time').value = hm(t);
   }
   function lastMl() {
     for (var i = DATA.feeds.length - 1; i >= 0; i--) { var m = DATA.feeds[i].label.match(/(\d+)ml/); if (m) return Number(m[1]); }
     return 120;
   }
   function lastKg() { var w = DATA.growth.filter(function (g) { return g.what === '體重'; }); return w.length ? w[w.length - 1].v : ''; }
-  function setKind(k) {
-    kind = k;
-    Array.prototype.forEach.call(document.querySelectorAll('#kind-seg button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-kind') === k)); });
-    Array.prototype.forEach.call(form.querySelectorAll('[data-for]'), function (f) { f.hidden = f.getAttribute('data-for') !== k; });
-    $('f-time-lab').textContent = k === 'sleep' ? '入睡時間' : '時間';
-    update();
-  }
-  function setDiaper(v) {
-    diaperV = v;
-    Array.prototype.forEach.call(document.querySelectorAll('#diaper-seg button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-v') === v)); });
-    update();
-  }
-  Array.prototype.forEach.call(document.querySelectorAll('#kind-seg button'), function (b) { b.addEventListener('click', function () { setKind(b.getAttribute('data-kind')); }); });
-  Array.prototype.forEach.call(document.querySelectorAll('#diaper-seg button'), function (b) { b.addEventListener('click', function () { setDiaper(b.getAttribute('data-v')); }); });
-  $('f-feedtype').addEventListener('change', function () {
-    var t = $('f-feedtype').value;
-    $('f-ml-lab').textContent = t === '母乳' ? '時間 (分鐘)' : t === '副食品' ? '份量 (g)' : '奶量 (ml)';
-    $('f-ml').value = t === '母乳' ? 15 : t === '副食品' ? 30 : lastMl();
-    update();
-  });
-  form.addEventListener('input', update);
 
-  function payload() {
-    return { kind: kind, day: Number($('f-date').value), time: $('f-time').value, end: $('f-end').value, feedType: $('f-feedtype').value,
-      amount: $('f-ml').value, diaper: diaperV, temp: $('f-temp').value, kg: $('f-kg').value };
-  }
-  function describeForm(p) {
-    if (!p.time) return '';
-    var when = md(p.day) + ' ' + p.time;
-    if (kind === 'feed') {
-      var unit = p.feedType === '母乳' ? '分鐘' : p.feedType === '副食品' ? 'g' : 'ml';
-      return p.amount ? when + ' ' + (p.feedType === '母乳' ? '親餵' : p.feedType) + ' ' + p.amount + unit : '';
+  function sleepTimerText() {
+    if (DATA.sleepingSince) {
+      $('sleep-state').textContent = '😴 ' + hm(DATA.sleepingSince) + ' 入睡，睡眠中';
+      $('sleep-elapsed').textContent = dur(Math.max(0, nowMs() - DATA.sleepingSince));
+      $('sleep-elapsed').className = 'elapsed';
+    } else {
+      $('sleep-state').textContent = '☀️ 寶寶醒著';
+      $('sleep-elapsed').textContent = '入睡時按下方「開始睡覺」，醒來再按「醒來了」';
+      $('sleep-elapsed').className = 'elapsed idle';
     }
-    if (kind === 'sleep') return p.end ? md(p.day) + ' ' + p.time + '–' + p.end + ' 睡眠' + (p.end <= p.time ? '（跨夜）' : '') : '';
-    if (kind === 'diaper') return when + ' 尿布 ' + { pee: '尿', poo: '便', both: '尿＋便' }[p.diaper];
-    if (kind === 'temp') return p.temp ? when + ' 體溫 ' + p.temp + '°C' : '';
-    return p.kg ? when + ' 體重 ' + p.kg + 'kg' : '';
   }
+  setInterval(function () { if (!overlay.hidden && S.kind === 'sleep') sleepTimerText(); }, 30000);
+
+  function setKind(k) {
+    // 從「手動補登睡眠」切到別的類型時，時間回到現在
+    if (S.kind === 'sleep' && S.sleepMode === 'range' && k !== 'sleep' && !overlay.hidden) setWhen(nowMs());
+    S.kind = k;
+    press('kind-seg', k);
+    var timer = k === 'sleep' && S.sleepMode === 'timer';
+    each('[data-for]', function (el) {
+      var f = el.getAttribute('data-for');
+      el.hidden = f === 'sleep-range' ? !(k === 'sleep' && S.sleepMode === 'range') : f !== k;
+    });
+    $('sleep-now').hidden = !timer;
+    $('note-card').hidden = k === 'sleep' || k === 'weight';
+    $('f-memo').placeholder = { feed: '例如：喝得比較慢', diaper: '例如：有點紅屁屁', temp: '例如：耳溫' }[k] || '';
+    $('f-time-lab').textContent = k !== 'sleep' ? '時間' : S.sleepMode === 'range' ? '入睡時間' : DATA.sleepingSince ? '醒來時間' : '入睡時間';
+    if (timer) sleepTimerText();
+    $('f-submit').textContent = timer ? (DATA.sleepingSince ? '☀️ 醒來了' : '🌙 開始睡覺') : '儲存紀錄';
+    update();
+  }
+
+  function pickedTime() {
+    var v = $('f-time').value;
+    if (!/^\d{2}:\d{2}$/.test(v)) return null;
+    return Number($('f-date').value) + (Number(v.slice(0, 2)) * 60 + Number(v.slice(3))) * MIN;
+  }
+  // 備註不能含有會被誤認成指令的字（例如尿布的「大」、「便」）
+  function memo() {
+    var m = $('f-memo').value.replace(/[\r\n]+/g, ' ').trim();
+    if (S.kind === 'diaper') m = m.replace(/[尿濕便屎大小]/g, '');
+    return m.slice(0, 30);
+  }
+  function feedWords() {
+    var a = S.amounts[amountCfg().key];
+    if (S.feedType === '母乳') return '母乳 ' + S.side + ' ' + a;
+    if (S.feedType === '混合') return '喝奶 ' + a + ' 混合餵養';
+    if (S.feedType === '副食品') return '副食品 ' + a + 'g';
+    return S.feedType + ' ' + a;
+  }
+  // 組出跟在 LINE 打字一樣的指令（今天的話省略日期，剛剛的話連時間也省略）
+  function build() {
+    var at = pickedTime();
+    if (at == null) return { err: '請選時間' };
+    if (at > nowMs() + 5 * MIN) return { err: '時間比現在晚，請確認日期和時間' };
+    var p = tw(at), day = dayOf(at), today = day === DATA.today;
+    var near = today && Math.abs(nowMs() - at) <= 5 * MIN;
+    var date = today ? '' : md(at) + ' ';
+    var when = date + (near ? '' : pad(p.h) + ':' + pad(p.mi) + ' ');
+    var whenLabel = (today ? '今天' : dayLabel(day)) + ' ' + hm(at);
+    var extra = memo(), parts;
+    if (S.kind === 'feed') {
+      var c = amountCfg(), a = S.amounts[c.key];
+      if (!(a >= c.min && a <= c.max)) return { err: c.label + '請填 ' + c.min + '～' + c.max + ' ' + c.unit };
+      parts = [feedWords()].concat(S.tags, extra ? [extra] : []);
+      return { text: when + parts.join(' '), label: whenLabel + ' · ' + { '配方奶': '配方奶', '瓶餵母乳': '母乳瓶餵', '母乳': '親餵' + S.side, '混合': '混合餵養', '副食品': '副食品' }[S.feedType] +
+        ' ' + a + c.unit + (S.tags.length ? ' · ' + S.tags.join('、') : '') };
+    }
+    if (S.kind === 'sleep') {
+      if (S.sleepMode === 'timer') {
+        if (DATA.sleepingSince && at <= DATA.sleepingSince) return { err: '醒來時間要比入睡時間（' + hm(DATA.sleepingSince) + '）晚' };
+        return DATA.sleepingSince
+          ? { text: when + '起床', label: whenLabel + ' 醒來 · 睡了 ' + dur(at - DATA.sleepingSince) }
+          : { text: when + '睡覺', label: whenLabel + ' 開始睡覺' };
+      }
+      var e = $('f-end').value;
+      if (!/^\d{2}:\d{2}$/.test(e)) return { err: '請選起床時間' };
+      var end = day + (Number(e.slice(0, 2)) * 60 + Number(e.slice(3))) * MIN;
+      if (end <= at) end += DAY; // 跨日，例如 23:00 睡到隔天 02:30
+      if (end > nowMs() + 5 * MIN) return { err: '起床時間比現在晚' };
+      return { text: md(at) + ' 睡 ' + hm(at) + '-' + e, label: whenLabel + ' – ' + (dayOf(end) !== day ? '隔天 ' : '') + e + ' · 共 ' + dur(end - at) };
+    }
+    if (S.kind === 'diaper') {
+      var name = { pee: '尿', poo: '便', both: '尿+便' }[S.diaper];
+      var poo = S.diaper !== 'pee';
+      parts = ['尿布 ' + name].concat(poo && S.color ? [S.color] : [], poo && S.texture ? [S.texture] : [], extra ? [extra] : []);
+      return { text: when + parts.join(' '), label: whenLabel + ' · ' + { pee: '尿尿', poo: '大便', both: '尿尿＋大便' }[S.diaper] +
+        (poo && (S.color || S.texture) ? '（' + [S.color, S.texture].filter(Boolean).join('、') + '）' : '') };
+    }
+    if (S.kind === 'temp') {
+      if (!(S.temp >= 34 && S.temp <= 42)) return { err: '體溫請填 34～42°C' };
+      return { text: when + '體溫 ' + S.temp.toFixed(1) + (extra ? ' ' + extra : ''), label: whenLabel + ' · 體溫 ' + S.temp.toFixed(1) + '°C' };
+    }
+    if (!(S.kg >= 1 && S.kg <= 30)) return { err: '體重請填公斤，例如 5.90' };
+    return { text: when + '體重 ' + Number(S.kg).toFixed(2) + 'kg', label: whenLabel + ' · 體重 ' + Number(S.kg).toFixed(2) + 'kg' };
+  }
+
   function update() {
-    var line = describeForm(payload());
-    $('f-preview').textContent = line ? (MODE ? '將記錄：' : '將補登：') + line : '';
-    $('f-preview').hidden = !line;
+    var r = build();
+    $('f-preview').textContent = r.err ? '' : r.label;
     $('f-err').textContent = '';
+    var b = $('temp-badge');
+    b.className = 'badge' + (S.temp >= 38 ? ' crit' : S.temp >= 37.5 ? ' warn' : '');
+    b.textContent = S.temp >= 38 ? '⚠️ 發燒，請留意寶寶狀況' : S.temp >= 37.5 ? '偏高，過一陣子再量一次' : '✓ 正常範圍';
   }
+
   function openForm(o) {
     o = o || {};
     lastFocus = document.activeElement; tip.hidden = true;
-    var at = o.at || round5(DATA.now);
+    form.classList.remove('is-done'); $('done').hidden = true;
+    var at = o.at || nowMs();
     fillDates();
-    $('f-date').value = String(dayOf(at));
-    if (!$('f-date').value) $('f-date').selectedIndex = 0;
-    $('f-time').value = hm(at);
-    $('f-end').value = hm(Math.min(at + HOUR, round5(DATA.now)));
-    $('f-ml').value = lastMl();
-    $('f-kg').value = lastKg();
+    setWhen(at);
+    $('f-end').value = hm(Math.min(at + HOUR, nowMs()));
+    if (S.sleepMode === 'range' && !o.at) { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); }
+    S.amounts.ml = lastMl();
+    S.kg = lastKg();
+    S.tags = []; press('feed-tags', '');
+    S.color = ''; S.texture = ''; press('poo-color', ''); press('poo-texture', '');
+    $('f-memo').value = '';
+    if (o.kind === 'sleep-range' || (o.at && (o.kind || S.kind) === 'sleep')) { S.sleepMode = 'range'; press('sleep-mode', 'range'); }
+    temp.set(S.temp); kg.set(S.kg);
+    refreshAmount();
     overlay.hidden = false;
-    setKind(o.kind || kind);
-    if (!MODE) $('f-time').focus(); // 從按鈕打開時不要直接跳出鍵盤
+    setKind(o.kind === 'sleep-range' ? 'sleep' : o.kind || S.kind);
+    if (!MODE) $('add-close').focus();
   }
   function closeForm() {
     if (MODE) { closeWindow(); return; }
@@ -2417,18 +2737,6 @@ var DATA = __DATA__;
     };
     document.head.appendChild(sdk);
   }
-  // 跟在 LINE 打字一樣的指令；今天的話省略日期，剛剛的話連時間也省略
-  function commandText(p) {
-    var today = p.day === DATA.today, nowHm = hm(DATA.now);
-    var near = today && Math.abs((Number(p.time.slice(0, 2)) * 60 + Number(p.time.slice(3))) - (Number(nowHm.slice(0, 2)) * 60 + Number(nowHm.slice(3)))) <= 5;
-    var date = today ? '' : md(p.day) + ' ';
-    var when = date + (near ? '' : p.time + ' ');
-    if (kind === 'feed') return when + p.feedType + ' ' + p.amount;
-    if (kind === 'sleep') return date + '睡 ' + p.time + '-' + p.end;
-    if (kind === 'diaper') return when + '尿布 ' + { pee: '尿', poo: '便', both: '尿+便' }[p.diaper];
-    if (kind === 'temp') return when + '體溫 ' + p.temp;
-    return when + '體重 ' + p.kg;
-  }
   function chatContext() {
     if (!liffReady) return null;
     try { var c = liff.getContext(); return c && (c.type === 'utou' || c.type === 'group' || c.type === 'room') ? c : null; } catch (e) { return null; }
@@ -2439,16 +2747,13 @@ var DATA = __DATA__;
     $('done-msg').textContent = message;
     $('done-close').focus();
   }
-  $('done-again').addEventListener('click', function () {
-    form.classList.remove('is-done'); $('done').hidden = true;
-    openForm({ kind: kind });
-  });
+  $('done-again').addEventListener('click', function () { openForm({ kind: S.kind }); });
   $('done-report').addEventListener('click', function () {
     MODE = null; document.body.classList.remove('form-mode');
     form.classList.remove('is-done'); $('done').hidden = true; overlay.hidden = true;
     drawAll(); scrollTo(0, 0);
   });
-  $('done-close').addEventListener('click', closeWindow);
+  $('done-close').addEventListener('click', function () { if (MODE) closeWindow(); else closeForm(); });
   $('add-btn').addEventListener('click', function () { openForm(); });
   $('add-close').addEventListener('click', closeForm);
   overlay.addEventListener('click', function (e) { if (e.target === overlay) closeForm(); });
@@ -2457,9 +2762,9 @@ var DATA = __DATA__;
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     if (saving) return;
-    var p = payload();
-    if (!describeForm(p)) { $('f-err').textContent = '請把時間和數值填完整'; return; }
-    var label = MODE ? '記錄' : '補登';
+    var r = build();
+    if (r.err) { $('f-err').textContent = r.err; return; }
+    var label = $('f-submit').textContent;
     saving = true; $('f-submit').disabled = true; $('f-submit').textContent = '儲存中…';
     function done() { saving = false; $('f-submit').disabled = false; $('f-submit').textContent = label; }
     function saveDirectly() {
@@ -2467,19 +2772,19 @@ var DATA = __DATA__;
       google.script.run
         .withSuccessHandler(function (res) {
           done();
-          if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || label + '失敗，請再試一次。'; return; }
-          DATA = res.data;
+          if (!res || !res.ok) { $('f-err').textContent = (res && res.message) || '儲存失敗，請再試一次。'; return; }
+          DATA = res.data; LOADED = Date.now();
           if (MODE) { showDone(res.message); return; }
           closeForm();
           drawAll();
           toast(res.message);
         })
-        .withFailureHandler(function (err) { done(); $('f-err').textContent = label + '失敗：' + (err && err.message ? err.message : err); })
-        .webAddRecord(KEY, p);
+        .withFailureHandler(function (err) { done(); $('f-err').textContent = '儲存失敗：' + (err && err.message ? err.message : err); })
+        .webAddRecord(KEY, { text: r.text });
     }
-    // 在 LINE 裡打開時，直接以你的名義把指令傳到聊天室，bot 會照常回覆；不行的話改成直接寫進試算表
+    // 在 LINE 裡打開時，以你的名義把指令傳到聊天室，bot 會照常回覆；不行的話改成直接寫進試算表
     if (MODE && chatContext()) {
-      liff.sendMessages([{ type: 'text', text: commandText(p) }])
+      liff.sendMessages([{ type: 'text', text: r.text }])
         .then(function () { done(); liff.closeWindow(); })
         .catch(saveDirectly);
       return;
@@ -2492,8 +2797,7 @@ var DATA = __DATA__;
   function drawAll() { drawHeader(); drawTiles(); drawGaps(); drawRhythm(); drawTrends(); drawGrowth(); }
   if (MODE) {
     document.body.classList.add('form-mode');
-    $('add-h').textContent = { feed: '🍼 記錄餵奶', diaper: '🧷 記錄尿布' }[MODE] || '＋ 記錄';
-    $('f-submit').textContent = '記錄';
+    $('add-h').textContent = '新增紀錄';
     $('f-note').textContent = '補錯了可以在 LINE 輸入「復原」刪掉。';
     openForm({ kind: MODE });
   } else {

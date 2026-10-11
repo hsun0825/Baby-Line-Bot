@@ -763,3 +763,31 @@ test('快速按鈕打開記錄表單（有 LIFF 用 LIFF，沒有用一般網址
   assert.equal(page.title, '寶寶作息報表');
   assert.ok(page.html.includes('var MODE = null;'));
 });
+
+test('新版表單送出文字指令：喝奶狀態、尿布顏色、睡眠計時，且不能執行其他指令', () => {
+  const ss = new FakeSpreadsheet();
+  const ctx = load({
+    SpreadsheetApp: { getActiveSpreadsheet: () => ss }, PropertiesService: { getScriptProperties: () => PROPS },
+    Utilities: FakeUtilities, ScriptApp: { getService: () => ({ getUrl: () => WEB_URL }) },
+  });
+  const key = ctx.reportKey('W1');
+  const add = (text) => ctx.webAddRecord(key, { text });
+  let r = add('配方奶 150 吐奶 拍嗝完成 喝比較慢');
+  assert.equal(r.ok, true);
+  assert.match(r.message, /🍼 \d\d:\d\d 配方奶 吐奶 拍嗝完成 喝比較慢 150ml/);
+  assert.match(add('喝奶 120 混合餵養').message, /喝奶 混合餵養 120ml/);
+  assert.match(add('母乳 右 12 喝到睡著').message, /母乳 右 喝到睡著 12分鐘/);
+  assert.match(add('尿布 便 黃色 糊狀').message, /尿布 便 黃色 糊狀/);
+  const twHm = (minsAgo) => new Date(Date.now() - minsAgo * 60000 + 8 * 3600000).toISOString().slice(11, 16);
+  r = add(twHm(120) + ' 睡覺');
+  assert.equal(r.ok, true);
+  assert.equal(typeof r.data.sleepingSince, 'number');
+  assert.equal(add(twHm(110) + ' 睡覺').ok, false); // 已經在睡
+  r = add(twHm(60) + ' 起床');
+  assert.equal(r.ok, true);
+  assert.equal(r.data.sleepingSince, null);
+  assert.equal(add('起床').ok, false);
+  for (const bad of ['復原', '匯出 30', '設定 性別 男', '哈哈']) assert.equal(add(bad).ok, false, bad);
+  const rows = ss.sheets['紀錄'].rows;
+  assert.equal(rows.length, 1 + 5); // 4 筆紀錄 + 1 段睡眠
+});
