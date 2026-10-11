@@ -14,7 +14,7 @@ const LINE_CHANNEL_ACCESS_TOKEN = '把你的 Channel access token 貼在這裡';
 // ===================================
 
 // 程式版本：用瀏覽器打開部署網址會顯示，用來確認 LINE 用的是不是新程式
-const APP_VERSION = '2026-10-11 寶寶日記 App';
+const APP_VERSION = '2026-10-11 寶寶日記 App（修正切換）';
 const TZ_NAME = 'Asia/Taipei';
 const TZ_OFFSET_HOURS = 8; // 台灣沒有日光節約時間，固定 +8
 const SHEET_NAME = '紀錄';
@@ -1942,6 +1942,7 @@ th { color: var(--ink-2); font-weight: 600; }
 .sleep-now { background: var(--t-sleep); border-radius: 20px; padding: 16px; text-align: center; display: flex; flex-direction: column; gap: 4px; }
 .sleep-now .state { font-size: 15px; color: var(--ink-2); font-weight: 600; }
 .sleep-now .elapsed { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-now .elapsed.idle { font-size: 15px; font-weight: 600; color: var(--ink-2); }
 .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: var(--page); color: var(--ink-2); align-self: center; }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.crit { background: var(--brand-soft); color: var(--crit); }
@@ -2175,11 +2176,11 @@ th { color: var(--ink-2); font-weight: 600; }
     <div class="sheet-head"><h2 id="add-h">新增紀錄</h2><button class="x" type="button" id="add-close" aria-label="關閉">✕</button></div>
 
     <div class="kinds" role="group" aria-label="紀錄類型" id="kind-seg">
-      <button type="button" class="kind" id="k-feed" data-kind="feed" aria-pressed="true"><span class="ic" aria-hidden="true">🍼</span>喝奶</button>
-      <button type="button" class="kind" id="k-sleep" data-kind="sleep" aria-pressed="false"><span class="ic" aria-hidden="true">🌙</span>睡眠</button>
-      <button type="button" class="kind" id="k-diaper" data-kind="diaper" aria-pressed="false"><span class="ic" aria-hidden="true">🧷</span>尿布</button>
-      <button type="button" class="kind" id="k-temp" data-kind="temp" aria-pressed="false"><span class="ic" aria-hidden="true">🌡️</span>體溫</button>
-      <button type="button" class="kind" id="k-weight" data-kind="weight" aria-pressed="false"><span class="ic" aria-hidden="true">⚖️</span>體重</button>
+      <button type="button" class="kind" id="k-feed" data-kind="feed" data-v="feed" aria-pressed="true"><span class="ic" aria-hidden="true">🍼</span>喝奶</button>
+      <button type="button" class="kind" id="k-sleep" data-kind="sleep" data-v="sleep" aria-pressed="false"><span class="ic" aria-hidden="true">🌙</span>睡眠</button>
+      <button type="button" class="kind" id="k-diaper" data-kind="diaper" data-v="diaper" aria-pressed="false"><span class="ic" aria-hidden="true">🧷</span>尿布</button>
+      <button type="button" class="kind" id="k-temp" data-kind="temp" data-v="temp" aria-pressed="false"><span class="ic" aria-hidden="true">🌡️</span>體溫</button>
+      <button type="button" class="kind" id="k-weight" data-kind="weight" data-v="weight" aria-pressed="false"><span class="ic" aria-hidden="true">⚖️</span>體重</button>
     </div>
 
     <div class="card" data-for="sleep">
@@ -3042,7 +3043,12 @@ var DATA = __DATA__;
   pills('feed-type', { change: function (v) { S.feedType = v; refreshAmount(); } });
   pills('feed-side', { change: function (v) { S.side = v; } });
   pills('feed-tags', { multi: true, change: function (v) { S.tags = v; } });
-  pills('sleep-mode', { change: function (v) { S.sleepMode = v; setKind('sleep'); } });
+  pills('sleep-mode', { change: function (v) {
+    S.sleepMode = v;
+    // 手動補登預設「一小時前睡到現在」
+    if (v === 'range') { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); } else { setWhen(nowMs()); }
+    setKind('sleep');
+  } });
   pills('diaper-seg', { change: function (v) { S.diaper = v; $('poo-more').hidden = v === 'pee'; } });
   pills('poo-color', { optional: true, change: function (v) { S.color = v; } });
   pills('poo-texture', { optional: true, change: function (v) { S.texture = v; } });
@@ -3100,14 +3106,19 @@ var DATA = __DATA__;
     if (DATA.sleepingSince) {
       $('sleep-state').textContent = '😴 ' + hm(DATA.sleepingSince) + ' 入睡，睡眠中';
       $('sleep-elapsed').textContent = dur(Math.max(0, nowMs() - DATA.sleepingSince));
+      $('sleep-elapsed').className = 'elapsed';
     } else {
       $('sleep-state').textContent = '☀️ 寶寶醒著';
-      $('sleep-elapsed').textContent = '按下面的按鈕開始計時';
+      $('sleep-elapsed').textContent = '入睡時按下方「開始睡覺」，醒來再按「醒來了」';
+      $('sleep-elapsed').className = 'elapsed idle';
     }
   }
   setInterval(function () { if (!overlay.hidden && S.kind === 'sleep') sleepTimerText(); }, 30000);
 
   function setKind(k) {
+    // 從「手動補登睡眠」切到別的類型時，時間回到現在
+    if (S.kind === 'sleep' && S.sleepMode === 'range' && k !== 'sleep' && !overlay.hidden) setWhen(nowMs());
+    if (k !== S.kind) $('f-memo').value = ''; // 備註只屬於這一種紀錄
     S.kind = k;
     press('kind-seg', k);
     var timer = k === 'sleep' && S.sleepMode === 'timer';
@@ -3117,6 +3128,7 @@ var DATA = __DATA__;
     });
     $('sleep-now').hidden = !timer;
     $('note-card').hidden = k === 'sleep' || k === 'weight';
+    $('f-memo').placeholder = { feed: '例如：喝得比較慢', diaper: '例如：有點紅屁屁', temp: '例如：耳溫' }[k] || '';
     $('f-time-lab').textContent = k !== 'sleep' ? '時間' : S.sleepMode === 'range' ? '入睡時間' : DATA.sleepingSince ? '醒來時間' : '入睡時間';
     if (timer) sleepTimerText();
     $('f-submit').textContent = timer ? (DATA.sleepingSince ? '☀️ 醒來了' : '🌙 開始睡覺') : '儲存紀錄';
@@ -3156,7 +3168,7 @@ var DATA = __DATA__;
       var c = amountCfg(), a = S.amounts[c.key];
       if (!(a >= c.min && a <= c.max)) return { err: c.label + '請填 ' + c.min + '～' + c.max + ' ' + c.unit };
       parts = [feedWords()].concat(S.tags, extra ? [extra] : []);
-      return { text: when + parts.join(' '), label: whenLabel + ' · ' + { '配方奶': '配方奶', '瓶餵母乳': '母乳瓶餵', '母乳': '親餵' + S.side, '混合': '混合餵養', '副食品': '副食品' }[S.feedType] +
+      return { text: when + parts.join(' '), label: whenLabel + ' · ' + { '配方奶': '配方奶', '瓶餵母乳': '母乳瓶餵', '母乳': '親餵' + { '左': '左側', '右': '右側', '雙邊': '雙側' }[S.side], '混合': '混合餵養', '副食品': '副食品' }[S.feedType] +
         ' ' + a + c.unit + (S.tags.length ? ' · ' + S.tags.join('、') : '') };
     }
     if (S.kind === 'sleep') {
@@ -3223,7 +3235,7 @@ var DATA = __DATA__;
     $('f-time-show').textContent = $('f-time').value || '--:--';
     $('f-end-show').textContent = $('f-end').value || '--:--';
     var r = build();
-    $('f-preview').textContent = r.err ? '' : r.label;
+    $('f-preview').textContent = r.err ? '⚠️ ' + r.err : r.label;
     $('f-err').textContent = '';
     nearby();
     var b = $('temp-badge');
@@ -3239,12 +3251,13 @@ var DATA = __DATA__;
     fillDates();
     setWhen(at);
     $('f-end').value = hm(Math.min(at + HOUR, nowMs()));
+    if (S.sleepMode === 'range' && !o.at) { setWhen(nowMs() - HOUR); $('f-end').value = hm(nowMs()); }
     S.amounts.ml = lastMl();
     S.kg = lastKg();
     S.tags = []; press('feed-tags', '');
     S.color = ''; S.texture = ''; press('poo-color', ''); press('poo-texture', '');
     $('f-memo').value = '';
-    if (o.kind === 'sleep-range' || (o.at && o.kind === 'sleep')) { S.sleepMode = 'range'; press('sleep-mode', 'range'); }
+    if (o.kind === 'sleep-range' || (o.at && (o.kind || S.kind) === 'sleep')) { S.sleepMode = 'range'; press('sleep-mode', 'range'); }
     temp.set(S.temp); kg.set(S.kg);
     refreshAmount();
     overlay.hidden = false;

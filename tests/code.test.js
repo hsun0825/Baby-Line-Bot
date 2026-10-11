@@ -835,3 +835,10 @@ test('新版表單送出文字指令：喝奶狀態、尿布顏色、睡眠計�
   const rows = ss.sheets['紀錄'].rows;
   assert.equal(rows.length, 1 + 5); // 4 筆紀錄 + 1 段睡眠
 });
+
+test('記錄表單上方每個類型按鈕都能被點選（有 data-v）', () => {
+  const html = load({}).reportHtml('k', {});
+  const kinds = html.match(/<button[^>]*data-kind="[a-z]+"[^>]*>/g);
+  assert.equal(kinds.length, 5);
+  for (const b of kinds) assert.match(b, /data-v="[a-z]+"/, b);
+});
